@@ -19,6 +19,7 @@ Usage:
   python clipper.py recording.mp4                                      # existing file / VOD
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -38,6 +39,8 @@ HERE = Path(__file__).resolve().parent
 FACE_MODEL = HERE / "models" / "face_detection_yunet_2023mar.onnx"
 OUT_W, OUT_H = 1080, 1920
 OUT_FPS = 30  # raised to 60 automatically for 60fps sources
+MAX_CAM_UPSCALE = 2.4  # --cam-upscale: never stretch a facecam more than this (0 = always full width)
+SHARPEN = True         # --no-sharpen: light contrast-adaptive sharpening on upscaled panels
 SR = 16000
 
 HYPE_WORDS = [
@@ -53,6 +56,21 @@ HYPE_WORDS = [
 
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+
+
+def _filter_script_opt():
+    """ffmpeg 7 replaced -filter_complex_script with -/filter_complex (newer ffmpeg rejects the old one)."""
+    try:
+        first = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True).stdout.split("\n", 1)[0]
+        m = re.search(r"ffmpeg version n?(\d+)\.", first)
+        if m and int(m.group(1)) < 7:
+            return "-filter_complex_script"
+    except Exception:
+        pass
+    return "-/filter_complex"   # also git builds ("N-12345-g...") and anything unparseable
+
+
+FILTER_SCRIPT = _filter_script_opt()
 
 
 def even(x):
@@ -75,26 +93,78 @@ def probe_duration(p):
         return 0.0
 
 
-def pick_encoder():
-    encs = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
-    if "h264_videotoolbox" in encs:
-        return ["-c:v", "h264_videotoolbox", "-b:v", "18M", "-maxrate", "24M", "-profile:v", "high"]
-    if "h264_nvenc" in encs:
-        return ["-c:v", "h264_nvenc", "-preset", "p5", "-b:v", "10M"]
-    return ["-c:v", "libx264", "-preset", "medium", "-crf", "17"]
+def probe_height(p):
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height",
+                          "-of", "csv=p=0", str(p)], capture_output=True, text=True).stdout.strip()
+    try:
+        return int(out.splitlines()[0])
+    except (ValueError, IndexError):
+        return 0
 
+
+def _encoder_works(pre, vf, args):
+    """Encode a few test frames: ffmpeg lists encoders it was built with, not ones this machine can run."""
+    r = subprocess.run(["ffmpeg", "-v", "error", *pre, "-f", "lavfi", "-i", "testsrc=s=256x256:r=30:d=0.2",
+                        "-vf", vf or "null", *args, "-f", "matroska", "-"], capture_output=True)
+    return r.returncode == 0 and len(r.stdout) > 1000
+
+
+def pick_encoder():
+    """Returns (args before the inputs, filter that hands frames to the encoder or None, encoder args)."""
+    encs = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+    cands = []
+    if "h264_videotoolbox" in encs:
+        cands.append(("Apple VideoToolbox", [], None,
+                      ["-c:v", "h264_videotoolbox", "-b:v", "18M", "-maxrate", "24M", "-profile:v", "high"]))
+    if "h264_nvenc" in encs:
+        cands.append(("NVIDIA NVENC", [], None, ["-c:v", "h264_nvenc", "-preset", "p5", "-b:v", "10M"]))
+    if "h264_vaapi" in encs:   # AMD / Intel on Linux
+        for dev in sorted(Path("/dev/dri").glob("renderD*")):
+            cands.append((f"VAAPI ({dev})", ["-vaapi_device", str(dev)], "format=nv12,hwupload",
+                          ["-c:v", "h264_vaapi", "-rc_mode", "VBR", "-b:v", "16M", "-maxrate", "24M",
+                           "-profile:v", "high"]))
+    for name, pre, vf, args in cands:
+        if _encoder_works(pre, vf, args):
+            log(f"encoder: {name}")
+            return pre, vf, args
+    log("encoder: libx264 (CPU)")
+    return [], None, ["-c:v", "libx264", "-preset", "medium", "-crf", "17"]
 
 # --------------------------------------------------------------------------------------
 # Source resolution + recording
 # --------------------------------------------------------------------------------------
 
-def resolve_stream(url, max_h):
+def format_selector(min_h, max_h):
+    """Best quality between min_h and max_h. No fallback below min_h: better no clip than a blurry one."""
+    h = f"[height>={min_h}][height<={max_h}]"
+    return f"bestvideo{h}+bestaudio/best{h}"
+
+
+class LowQualitySource(Exception):
+    pass
+
+
+class _QuietYDL:   # yt-dlp prints errors even with quiet=True; we log our own reason instead
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+
+def resolve_stream(url, min_h, max_h):
     import yt_dlp
-    opts = {"quiet": True, "no_warnings": True,
-            "format": f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]/best"}
-    with yt_dlp.YoutubeDL(opts) as y:
-        info = y.extract_info(url, download=False)
+    opts = {"quiet": True, "no_warnings": True, "logger": _QuietYDL(), "format": format_selector(min_h, max_h)}
+    try:
+        with yt_dlp.YoutubeDL(opts) as y:
+            info = y.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        if "format is not available" in str(e):
+            raise LowQualitySource(f"no {min_h}p+ video available (use --min-height to allow lower)") from None
+        raise
     fmts = info.get("requested_formats") or [info]
+    height = info.get("height") or max((f.get("height") or 0) for f in fmts)
+    if height < min_h:
+        raise LowQualitySource(f"best available video is {height}p, below --min-height {min_h}")
     return info, [f["url"] for f in fmts]
 
 
@@ -102,9 +172,10 @@ class Recorder(threading.Thread):
     """Keeps an ffmpeg process recording the live stream into numbered segments.
     Re-resolves and reconnects when ffmpeg drops (URLs expire, network blips)."""
 
-    def __init__(self, url, segdir, seg_time, max_h):
+    def __init__(self, url, segdir, seg_time, min_h, max_h):
         super().__init__(daemon=True)
-        self.url, self.segdir, self.seg_time, self.max_h = url, Path(segdir), seg_time, max_h
+        self.url, self.segdir, self.seg_time = url, Path(segdir), seg_time
+        self.min_h, self.max_h = min_h, max_h
         self.stop_evt = threading.Event()
         self.proc = None
         self.ended = False
@@ -117,10 +188,11 @@ class Recorder(threading.Thread):
         fails = 0
         while not self.stop_evt.is_set():
             try:
-                info, urls = resolve_stream(self.url, self.max_h)
-            except Exception as e:  # stream ended / offline / network
+                info, urls = resolve_stream(self.url, self.min_h, self.max_h)
+            except Exception as e:  # stream ended / offline / network / quality dropped below --min-height
                 fails += 1
-                log(f"recorder: could not resolve stream ({e.__class__.__name__}); retry {fails}/6")
+                why = str(e) if isinstance(e, LowQualitySource) else e.__class__.__name__
+                log(f"recorder: could not resolve stream ({why}); retry {fails}/6")
                 if fails >= 6:
                     break
                 time.sleep(10)
@@ -140,12 +212,37 @@ class Recorder(threading.Thread):
                     "-segment_start_number", str(self._next_index()),
                     str(self.segdir / "seg_%06d.ts")]
             log(f"recorder: recording '{info.get('title', '?')}' ({info.get('height', '?')}p)")
-            self.proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
-            _, err = self.proc.communicate()
+            errlog = self.segdir.parent / "recorder.log"
+            started = time.time()
+            with open(errlog, "a") as ef:
+                self.proc = subprocess.Popen(cmd, stderr=ef, stdin=subprocess.DEVNULL)
+                # watchdog: ffmpeg can hang forever when the platform stops sending data without closing the
+                # connection, so if no segment grows for a while, kill it and reconnect
+                stall_limit = max(45.0, self.seg_time * 1.5)
+                last_sig, last_change = None, time.time()
+                while self.proc.poll() is None and not self.stop_evt.is_set():
+                    time.sleep(3)
+                    segs = list(self.segdir.glob("seg_*.ts"))
+                    newest = max(segs, key=lambda p: p.stat().st_mtime, default=None)
+                    sig = (newest.name, newest.stat().st_size) if newest else None
+                    if sig != last_sig:
+                        last_sig, last_change = sig, time.time()
+                    elif time.time() - last_change > stall_limit:
+                        log(f"recorder: no new video for {stall_limit:.0f}s (stream stalled); reconnecting")
+                        self.proc.kill()
+                        self.proc.wait()
+                        break
+                self.proc.wait()
             if self.stop_evt.is_set():
                 break
-            errs = [l for l in (err or "").splitlines() if not l.startswith("[hls")][-2:]
+            try:
+                err = errlog.read_text(errors="ignore")[-4000:]
+            except OSError:
+                err = ""
+            errs = [l for l in err.splitlines() if not l.startswith("[hls")][-2:]
             log("recorder: ffmpeg exited" + (f" ({' | '.join(errs)})" if errs else "") + "; reconnecting")
+            if time.time() - started > 120:   # it was recording fine: a blip, not a dead stream
+                fails = 0
             fails += 1
             if fails >= 6:
                 break
@@ -190,9 +287,17 @@ class ChatCounter:
     def __init__(self):
         self.lock = threading.Lock()
         self.walls = []  # (wall-clock timestamp, hype 0..3, paid?)
+        self.last_by = {}  # author -> wall time of their last counted message
 
-    def add(self, ts, text="", paid=False):
+    SPAM_WINDOW = 8.0
+
+    def add(self, ts, text="", paid=False, author=None):
         with self.lock:
+            if author and not paid:
+                last = self.last_by.get(author)
+                if last is not None and abs(ts - last) < self.SPAM_WINDOW:
+                    return
+                self.last_by[author] = ts
             self.walls.append((ts, chat_hype(text), paid))
 
     def snapshot(self):
@@ -248,7 +353,8 @@ def youtube_chat_thread(url, workdir, counter, stop_evt):
                         runs = (r.get("message") or {}).get("runs") or []
                         text = " ".join(x.get("text") or ":" + str(((x.get("emoji") or {}).get("shortcuts") or ["e"])[0])
                                         for x in runs)
-                        counter.add(int(r["timestampUsec"]) / 1e6, text, kind == "liveChatPaidMessageRenderer")
+                        counter.add(int(r["timestampUsec"]) / 1e6, text, kind == "liveChatPaidMessageRenderer",
+                                    r.get("authorExternalChannelId"))
             time.sleep(2)
     finally:
         proc.terminate()
@@ -272,8 +378,9 @@ def twitch_chat_thread(channel, counter, stop_evt):
                         s.sendall(b"PONG :tmi.twitch.tv\r\n")
                     elif b" PRIVMSG #" in l:
                         msg = l.split(b" PRIVMSG #", 1)[1].split(b" :", 1)
+                        nick = re.search(rb"(?:^|\s):([^!\s]+)!", l)
                         counter.add(time.time(), msg[1].decode("utf-8", "ignore") if len(msg) > 1 else "",
-                                    b"bits=" in l.split(b" ", 1)[0])
+                                    b"bits=" in l.split(b" ", 1)[0], nick.group(1) if nick else None)
         except Exception:
             time.sleep(5)
 
@@ -296,6 +403,19 @@ class Word:
     t0: float
     t1: float
     text: str
+
+
+def wav_bytes(audio):
+    """16-bit mono WAV of a float32 SR-rate signal."""
+    import io
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SR)
+        wf.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+    return buf.getvalue()
 
 
 def decode_audio(path):
@@ -323,13 +443,21 @@ class EmotionReader:
             self.det = cv2.FaceDetectorYN.create(str(FACE_MODEL), "", (320, 320), 0.6, 0.3, 20)
             self.net = cv2.dnn.readNet(str(FER_MODEL))
 
-    def read(self, img):
+    def read(self, img, expect=None):
+        """expect=(cx, cy, w) of the streamer's face in img: faces elsewhere or of a different size (e.g. game
+        characters in a cutscene showing through the facecam box) are ignored."""
         cv2 = self.cv2
         h, w = img.shape[:2]
         self.det.setInputSize((w, h))
         _, fs = self.det.detect(img)
         if fs is None or not len(fs):
             return None
+        if expect is not None:
+            ex, ey, ew = expect
+            fs = [r for r in fs if abs(r[0] + r[2] / 2 - ex) < 0.6 * ew and abs(r[1] + r[3] / 2 - ey) < 0.6 * ew
+                  and 0.6 < r[2] / ew < 1.6]
+            if not fs:
+                return None
         f = max(fs, key=lambda r: r[2] * r[3])
         M, _ = cv2.estimateAffinePartial2D(f[4:14].reshape(5, 2).astype(np.float32), _FER_STD)
         if M is None:
@@ -378,7 +506,13 @@ class Timeline:
             ow = 320
             oh = even(ow * (y1 - y0) / max(1, x1 - x0))
             vf = f"crop={even(x1 - x0)}:{even(y1 - y0)}:{even(x0)}:{even(y0)},scale={ow}:{oh}"
+            expect = None
+            if lay.get("face"):
+                fx, fy, fw, fh = lay["face"]
+                sc = ow / max(1, even(x1 - x0))
+                expect = ((fx + fw / 2 - even(x0)) * sc, (fy + fh / 2 - even(y0)) * sc, fw * sc)
         else:
+            expect = None
             ow, oh = 640, even(640 * H / W)
             vf = f"scale={ow}:{oh}"
         raw = subprocess.run(["ffmpeg", "-v", "error", "-i", seg.path, "-an", "-vf",
@@ -387,7 +521,7 @@ class Timeline:
         fsz = ow * oh * 3
         for k in range(len(raw) // fsz):
             img = np.frombuffer(raw[k * fsz:(k + 1) * fsz], np.uint8).reshape(oh, ow, 3)
-            p = self.emotion.read(img)
+            p = self.emotion.read(img, expect)
             if p is not None:
                 self.emo_bins.setdefault(int(seg.t0 + (k + 0.5) / self.EMO_FPS), []).append(p)
 
@@ -422,8 +556,13 @@ class Timeline:
         if lay and lay.get("mode") == "split":
             sx, sy = self.MW / lay["W"], self.MH / lay["H"]
             cx, cy, cw, ch = lay["cam"]
+            x0, y0, x1, y1 = cx, cy, cx + cw, cy + ch
+            if lay.get("face"):   # only around the head: facecams often carry a scrolling chat/alert overlay
+                fx, fy, fw, fh = lay["face"]
+                x0, x1 = max(cx, fx - fw * 0.6), min(cx + cw, fx + fw * 1.6)
+                y0, y1 = max(cy, fy - fh * 0.4), min(cy + ch, fy + fh * 1.5)
             face_mask = np.zeros((self.MH, self.MW), bool)
-            face_mask[int(cy * sy):int((cy + ch) * sy) + 1, int(cx * sx):int((cx + cw) * sx) + 1] = True
+            face_mask[int(y0 * sy):int(y1 * sy) + 1, int(x0 * sx):int(x1 * sx) + 1] = True
         diffs = np.abs(np.diff(frames, axis=0)).astype(np.float32)
         for k in range(diffs.shape[0]):
             d = diffs[k]
@@ -479,6 +618,19 @@ class Timeline:
             c.append((arr[i] - med) / mad)
         return np.array(c[:len(arr)])
 
+    def _rolling_median(self, name, arr, window=300):
+        """Per-column median of the trailing `window` bins (NaN = no data), cached like _robust_z."""
+        c = self._z.setdefault(name, [])
+        del c[max(0, len(arr) - 3):]
+        fallback = np.nanmedian(arr, axis=0) if np.isfinite(arr).any() else np.zeros(arr.shape[1])
+        fallback = np.nan_to_num(fallback)
+        for i in range(len(c), len(arr)):
+            lo = max(0, i - window)
+            w = arr[lo:i] if i - lo >= 30 else arr[:max(i, 30)]
+            ok = np.isfinite(w[:, 0])
+            c.append(np.median(w[ok], axis=0) if ok.sum() >= 10 else fallback)
+        return np.array(c[:len(arr)])
+
     @staticmethod
     def _smooth(x, k):
         return np.convolve(x, np.ones(k) / k, mode="same")
@@ -505,17 +657,22 @@ class Timeline:
                 a = np.array(v)
                 game[b] = np.median(a[:, 0])
                 face[b] = a[:, 1].mean()
-        emo = np.zeros(n)                 # 0..1 facial excitement
-        emo_label = [""] * n
+        # Facial excitement RELATIVE to this streamer's usual face: some resting faces read as "happy" to the
+        # model all the time, so each emotion only counts by how far it rises above its own recent median.
+        probs = np.full((n, len(EMOTIONS)), np.nan)
         for b in range(n):
             v = self.emo_bins.get(b)
             if v:
-                a = np.array(v)
-                sc = a @ EMO_WEIGHT
-                k = int(np.argmax(sc))
-                emo[b] = float(sc[k])
-                if emo[b] > 0.45:
-                    emo_label[b] = EMOTIONS[int(np.argmax(a[k] * (EMO_WEIGHT > 0)))]
+                probs[b] = np.array(v).max(axis=0)
+        base = self._rolling_median("emo_base", probs)
+        spread = np.maximum(self._rolling_median("emo_mad", np.abs(probs - base)) * 1.4826, 0.15)
+        # how many "usual wobbles" above normal each emotion is; a model that flickers on this face scores low
+        excess = np.clip(np.nan_to_num((probs - base) / spread, nan=0.0), 0, 6) * EMO_WEIGHT
+        emo = np.clip(excess.max(axis=1) / 5, 0, 1)   # 0 = their normal face .. 1 = far beyond it
+        emo_label = [""] * n
+        for b in range(n):
+            if emo[b] > 0.5:
+                emo_label[b] = EMOTIONS[int(np.argmax(excess[b]))]
         heat = np.zeros(n)
         for h in self.heat:
             heat[int(h["start_time"]):min(n, int(h["end_time"]) + 1)] = h["value"]
@@ -572,18 +729,36 @@ class Timeline:
              + 0.60 * np.clip(self._smooth(kw, 3) * 3, 0, 3)
              + 0.45 * pos(z["face"], 3)       # streamer physically reacting
              + 0.30 * pos(z["game"], 3)       # explosions / chases / action on screen
-             + 0.30 * pos(z["speech"], 3)     # rapid talking
+             + 0.12 * pos(z["speech"], 3)     # rapid talking (weak: most streamers talk non-stop)
              + 0.40 * payoff
-             + 1.20 * np.clip(emo_s - 0.25, 0, 1) / 0.75   # surprised / laughing / scared face
-             + 0.40 * pos(z["emo"], 3)                      # unusually expressive for this streamer
+             + 2.00 * np.clip((emo_s - 0.3) / 0.4, 0, 1.5)  # surprised / laughing / scared, beyond their usual face
              + 3.00 * heat)                                 # YouTube viewers rewatched this part
         # multi-signal agreement bonus: moments where several channels fire together are the real ones
-        agree = ((z["loud"] > 1.5).astype(float) + (z["chat"] > 1.5) + (z["face"] > 1.5)
-                 + (z["game"] > 1.5) + (kw > 0) + (z["chat_h"] > 1.5) + (emo_s > 0.5))
+        agree = ((z["loud"] > 1.5).astype(float) + (z["chat"] > 1.5) + (z["face"] > 2.0)
+                 + (z["game"] > 2.0) + (kw > 0) + (z["chat_h"] > 1.5) + (emo_s > 0.5))
         e = e * (1 + 0.15 * np.clip(agree - 1, 0, 5))
+        # A clip needs the STREAMER to react (louder than usual, a scream, hype words, an expression well beyond
+        # their norm, or a big physical reaction). Chat or gameplay alone can't place a moment, so without one
+        # of these nearby (+-3s) the score is cut hard.
+        # Independent sources must AGREE: game audio alone (music, NPCs, explosions), chat spam alone, or the
+        # streamer shifting in their chair alone are not moments. Each source counts if it fires within +-4s.
+        near = lambda x: np.convolve(x.astype(float), np.ones(9), mode="same") > 0
+        src_audio = near((z["loud"] > 1.5) | (scream > 0.5) | (kw > 0) | (payoff > 1.5))
+        src_face = near((emo_s > 0.6) | (z["face"] > 4.5))   # mere head movement while talking is ~3
+        src_chat = near((z["chat"] > 2.0) | (z["chat_h"] > 2.0))
+        sources = src_audio.astype(int) + src_face + src_chat + 2 * near(heat > 0.5)
+        ok = sources >= 2
+        if self.layout and self.layout.get("mode") in ("split", "track") and emo.any():
+            # with a facecam, the streamer has to be part of it: chat + game audio during a cutscene is the
+            # audience reacting to the game, not a streamer moment
+            ok &= src_face | near(heat > 0.5)
+        e = np.where(ok, e, e * 0.35)
         e_s = self._smooth(e, 5)
+        face_seen = np.array([b in self.emo_bins for b in range(n)])
         return {"E": e_s, "raw": e, "z": z, "kw": kw, "chat": chat, "agree": agree, "payoff": payoff,
-                "emo": emo_s, "emo_label": emo_label, "heat": heat}
+                "emo": emo_s, "emo_label": emo_label, "heat": heat, "face_seen": face_seen, "sources": sources,
+                "facecam": bool(self.layout and self.layout.get("mode") == "split" and self.emotion
+                                and self.emotion.ok)}
 
     def words_between(self, a, b):
         return [w for w in self.words if w.t1 > a and w.t0 < b]
@@ -606,6 +781,34 @@ class Clip:
     emotion: str = ""
     file: str = ""
     replaces: object = None   # earlier Clip this one supersedes (two moments merged into one clip)
+    edges: str = "signals"    # who chose start/end: "signals", or "groq <model>: <why>"
+
+
+@contextlib.contextmanager
+def render_turn():
+    """Render queue shared by every clipper running on this machine: rendering is the memory-hungry part
+    (1080p60 decode + filters + encode), so jobs take turns instead of rendering at the same time."""
+    import fcntl
+    path = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "hypecut-render.lock"
+    with open(path, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log("render queue: another job is rendering, waiting for my turn...")
+            t0 = time.time()
+            fcntl.flock(f, fcntl.LOCK_EX)
+            log(f"render queue: my turn (waited {time.time() - t0:.0f}s)")
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+TEASER_IN = "TEASER_INPUT"   # placeholder for the teaser's ffmpeg input index, filled in per command
+
+
+def with_teaser_index(script, idx):
+    return script.replace(f"[{TEASER_IN}:", f"[{idx}:")
 
 
 def snap_edges(words, start, end, peak, cmin, cmax):
@@ -654,7 +857,7 @@ def explain(feats, i):
         r.append("chat hyped (LOL/W/emotes)")
     if feats["kw"][sl].sum() > 0:
         r.append("hype words")
-    if z["face"][sl].max() > 2:
+    if z["face"][sl].max() > 4.0:
         r.append("big physical reaction")
     if z["game"][sl].max() > 2:
         r.append("on-screen action")
@@ -663,15 +866,17 @@ def explain(feats, i):
     return r
 
 
-def find_clips(tl, feats, frontier, avail, last_end, args, percentile, prev=None):
+def find_clips(tl, feats, frontier, avail, last_end, args, percentile, prev=None, ahead=0.0):
     E = feats["E"]
     if avail - frontier < 3:
         return [], frontier
-    thr = args.threshold
-    if avail > 90:
-        thr = max(thr, float(np.percentile(E[:avail], percentile)))
+    if avail < args.warmup:     # no clips until we know what "normal" looks like for this stream
+        return [], frontier
+    thr = max(args.threshold, float(np.percentile(E[:avail], percentile)))
+    # ahead of --target-per-hour (busy missions are full of peaks): only clearly bigger moments get through
+    thr *= 1 + 0.12 * float(np.clip(ahead - 1, 0, 8))
     clips = []
-    i = max(frontier, 6)
+    i = max(frontier, 60)   # the first minute has no baseline yet, so its z-scores mean little
     while i < avail:
         lo, hi = max(0, i - 8), min(len(E), i + 9)
         is_peak = E[i] >= thr and E[i] == E[lo:hi].max()
@@ -679,6 +884,12 @@ def find_clips(tl, feats, frontier, avail, last_end, args, percentile, prev=None
         # a second moment right after the previous clip: regenerate ONE clip covering both
         merge = (is_peak and not gap_ok and prev is not None and i > prev.end
                  and (i + args.aftermath + 2) - prev.start <= args.max_len)
+        if is_peak and feats.get("facecam"):
+            # streams with a facecam: the streamer must actually be on camera (cutscenes / BRB screens hide
+            # the cam, and then the "hype" is just game audio and NPC dialogue)
+            seen = feats["face_seen"][max(0, i - 6):i + 4]
+            if len(seen) and seen.mean() < 0.5:
+                is_peak = False
         if is_peak and (gap_ok or merge):
             # how long does the moment last? (energy stays above 55% of the peak)
             a = i
@@ -687,7 +898,19 @@ def find_clips(tl, feats, frontier, avail, last_end, args, percentile, prev=None
             b = i
             while b < len(E) - 1 and b < i + 40 and E[b + 1] >= 0.55 * E[i]:
                 b += 1
-            start = a - args.setup            # context before the moment
+            # dynamic edges: reach back to where the build-up started, and forward until the reaction has
+            # died down (energy below "calm" for 3s), instead of a fixed few seconds around the peak
+            calm = max(0.3 * E[i], 1.3 * float(np.median(E[max(0, i - 300):i + 1])))
+            while a > max(0, i - 40) and E[a - 1] >= calm:
+                a -= 1
+            quiet, j = 0, b
+            while j < len(E) - 1 and j < b + 30:
+                j += 1
+                quiet = quiet + 1 if E[j] < calm else 0
+                if quiet >= 3:
+                    break
+            b = j - quiet if quiet >= 3 else j
+            start = a - args.setup            # context before the build-up
             end = b + args.aftermath          # let the reaction land
             if end - start < args.min_len:
                 pad = args.min_len - (end - start)
@@ -785,6 +1008,60 @@ def ai_review(client, model, tl, clip, args):
     return v
 
 
+EDGE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["start", "end", "reason"],
+               "properties": {"start": {"type": "number"}, "end": {"type": "number"},
+                              "reason": {"type": "string"}}}
+
+
+def groq_edges(tl, feats, clip, lo, args):
+    """Groq reads the timestamped transcript + energy curve around the moment and picks start/end so the clip
+    has its setup and its payoff. Changes clip in place; returns True when it moved the edges."""
+    import groq_client
+    c0 = max(lo, clip.start - 25)
+    c1 = min(tl.end, clip.end + 20)
+    lines, cur, cur_t = [], [], None
+    for w in tl.words_between(c0, c1):
+        if cur_t is None:
+            cur_t = w.t0
+        cur.append(w.text)
+        if w.text.endswith((".", "?", "!")) or len(cur) >= 14:
+            lines.append(f"[{max(0.0, cur_t - c0):5.1f}s] {' '.join(cur)}")
+            cur, cur_t = [], None
+    if cur:
+        lines.append(f"[{max(0.0, cur_t - c0):5.1f}s] {' '.join(cur)}")
+    E = feats["E"]
+    curve = ", ".join(f"{t - c0:.0f}s:{E[t]:.1f}" for t in range(int(c0), min(int(c1), len(E)), 2))
+    prompt = (
+        "You cut moments from a live stream into YouTube Shorts / TikToks. Choose where this clip starts and ends.\n"
+        f"Window: {c1 - c0:.0f}s of stream. Timestamps are seconds from the window start. The streamer may speak "
+        "English, Hindi/Urdu or Hinglish (rough automatic transcript).\n"
+        f"Our detector found the peak at {clip.peak - c0:.1f}s ({', '.join(clip.reasons) or 'high energy'}) and "
+        f"proposed {clip.start - c0:.1f}s-{clip.end - c0:.1f}s.\n\n"
+        f"TRANSCRIPT:\n{chr(10).join(lines) or '(no speech - the reaction may be non-verbal)'}\n\n"
+        f"EXCITEMENT every 2s (higher = louder/hype; normal is about 1): {curve}\n\n"
+        "Rules: start at the beginning of a sentence just before the SETUP (what leads to the moment), so a viewer "
+        "with no context understands what is happening. Include the peak. End right after the reaction or "
+        "payoff has fully landed (don't cut a laugh, rant or punchline short), but cut the dead air after it. "
+        f"The length follows the story: {args.min_len:.0f}s for a quick moment, up to {args.max_len:.0f}s when "
+        "the build-up needs it. Reply with start and end in window seconds and a short reason.")
+    try:
+        v, model = groq_client.chat_json(prompt, EDGE_SCHEMA, name="clip_edges", timeout=30)
+    except groq_client.GroqError as e:
+        log(f"edges: groq unavailable ({str(e)[:120]}); keeping signal edges")
+        return False
+    s, e = c0 + float(v["start"]), c0 + float(v["end"])
+    if not (c0 <= s < e <= c1 and s <= clip.peak - 1 and e >= clip.peak + 1
+            and args.min_len * 0.8 <= e - s <= args.max_len * 1.1):
+        log(f"edges: groq answer out of range ({v['start']}-{v['end']}s); keeping signal edges")
+        return False
+    s, e = snap_edges(tl.words_between(s - 5, e + 6), s, e, clip.peak, args.min_len, args.max_len)
+    s = max(s, lo)
+    log(f"edges: groq {clip.start:.0f}-{clip.end:.0f}s -> {s:.0f}-{e:.0f}s ({e - s:.0f}s): {v['reason'][:100]}")
+    clip.start, clip.end = s, min(e, tl.end)
+    clip.edges = f"groq {model.split('/')[-1]}: {v['reason'][:160]}"
+    return True
+
+
 # --------------------------------------------------------------------------------------
 # Layout detection (facecam)
 # --------------------------------------------------------------------------------------
@@ -815,6 +1092,24 @@ def sample_frames(paths, n=10):
                 if fr is not None:
                     frames.append(fr)
     return frames
+
+
+def steadier_layout(new, known):
+    """Facecam boxes found while the streamer moves a lot are unreliable (edges get confused with the game).
+    Keep the steadier known box, but take the fresh face position if it still sits inside it."""
+    if not new or not known or new.get("mode") != "split" or known.get("mode") != "split":
+        return new or known
+    ax, ay, aw, ah = new["cam"]
+    bx, by, bw, bh = known["cam"]
+    inter = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
+    iou = inter / max(1, aw * ah + bw * bh - inter)
+    # a box somewhere else is almost always a game character's face (cutscene), not a moved facecam
+    if iou >= 0.75 and new.get("jitter", 9) <= known.get("jitter", 9):
+        return new
+    cx, cy, cw, ch = known["cam"]
+    fx, fy, fw, fh = new["face"]
+    inside = cx <= fx and fx + fw <= cx + cw and cy <= fy and fy + fh <= cy + ch
+    return {**known, "face": new["face"] if inside else known["face"]}
 
 
 def detect_layout(frames):
@@ -862,7 +1157,8 @@ def detect_layout(frames):
         if hi - lo < 3:
             return None
         seg = profile[lo:hi]
-        thr = max(2.5 * (np.median(seg) + 1e-3), 8)
+        # a real cam border is far stronger than patterns inside the cam (a striped shirt, a desk edge)
+        thr = max(2.5 * (np.median(seg) + 1e-3), 0.5 * float(seg.max()), 8)
         idx = np.nonzero(seg > thr)[0]
         return lo + int(idx[0]) if len(idx) else None
 
@@ -873,21 +1169,71 @@ def detect_layout(frames):
     near = 1.3
     left = 0 if fx < fw * near else strongest(colp, fx - 2.5 * fw, fx - 0.1 * fw)
     right = sw if sw - (fx + fw) < fw * near else strongest(colp, fx + 1.1 * fw, fx + fw + 2.5 * fw)
-    top = 0 if fy < fh * near else strongest(rowp, fy - 2.0 * fh, fy - 0.1 * fh)
-    bottom = sh if sh - (fy + fh) < fh * 0.4 else first_strong(rowp, fy + 0.95 * fh, fy + fh + 1.6 * fh)
     left = left if left is not None else max(0, fx - 1.0 * fw)
     right = right if right is not None else min(sw, fx + 2.0 * fw)
+    # top/bottom borders run across the WHOLE cam width; a chin, collar or desk edge only spans the person.
+    # The median over all columns of the box keeps full-width lines and drops local ones.
+    rowp_w = np.median(ey[:, int(left):max(int(left) + 1, int(right))], axis=1)
+    top = 0 if fy < fh * near else strongest(rowp_w, fy - 2.0 * fh, fy - 0.1 * fh)
+    bottom = (sh if sh - (fy + fh) < fh * 0.4 else
+              first_strong(rowp_w, fy + 0.95 * fh, fy + fh + 1.6 * fh))
     top = top if top is not None else max(0, fy - 0.7 * fh)
     bottom = bottom if bottom is not None else min(sh, fy + 1.3 * fh)
     cam = tuple(v / scale for v in (left, top, right - left, bottom - top))
     return {"mode": "split", "W": W, "H": H, "face": tuple(v / scale for v in (fx, fy, fw, fh)),
-            "cam": cam, "jitter": float(spread)}
+            "cam": cam, "jitter": float(spread), "active": letterbox_rows(frames)}
 
 
-def build_filter(layout, ass_name, src="[0:v]", zoom=None, dur=None, progress=False):
+def letterbox_rows(frames):
+    """(top, bottom) source rows of the picture inside cinematic bars: rows that stay black in EVERY frame.
+    Row medians, so a facecam or viewer counter sitting inside a bar doesn't count as picture."""
+    import cv2
+    if not frames:
+        return None
+    H = frames[0].shape[0]
+    rmax = np.max([np.median(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), axis=1) for f in frames], axis=0)
+    lit = np.nonzero(rmax > 14)[0]
+    y0, y1 = (int(lit[0]), int(lit[-1]) + 1) if len(lit) else (0, H)
+    if y0 < H * 0.02 and H - y1 < H * 0.02:
+        return (0, H)
+    return (y0, y1)
+
+
+def build_filter(layout, ass_name, src="[0:v]", zoom=None, dur=None, progress=False, cam_src=None, cam_k=4):
     W, H = layout["W"], layout["H"]
     mode = layout["mode"]
-    if mode == "split":
+    if mode == "float":
+        # full-screen 9:16 gameplay with the facecam floating top-right (head & shoulders, kept small = sharp)
+        cx, cy, cw, ch = layout["cam"]
+        fx, fy, fw, fh = layout["face"]
+        ay0, ay1 = layout.get("active", (0, H))   # inside any letterbox bars
+        gh = even(ay1 - ay0)
+        gw = min(W, even(gh * OUT_W / OUT_H))
+        gx = (W - gw) / 2
+        if gx < cx + cw and cx < gx + gw:     # the stream's own facecam would show inside the crop: slide away
+            gx = cx + cw if cx + cw / 2 < W / 2 else cx - gw
+            gx = min(max(gx, 0), W - gw)
+        side = min(cw, ch, max(fw * 2.7, fh * 2.2))          # square around the head; whole cam if it's a close-up
+        sw_, sh_ = min(cw, side), min(ch, side)
+        sx = min(max(fx + fw / 2 - sw_ / 2, cx), cx + cw - sw_)
+        sy = min(max(fy + fh * 0.55 - sh_ / 2, cy), cy + ch - sh_)
+        k = min(MAX_CAM_UPSCALE or 2.4, OUT_W * 0.5 / sw_)
+        ow, oh = even(sw_ * k), even(sh_ * k)
+        if cam_src:   # AI-upscaled frames are the cam box at cam_k x
+            camf = (f"{cam_src}crop={even(sw_ * cam_k)}:{even(sh_ * cam_k)}:{even((sx - even(cx)) * cam_k)}:"
+                    f"{even((sy - even(cy)) * cam_k)},scale={ow}:{oh}:flags=lanczos")
+            head = f"{src}null[g];"
+        else:
+            camf = (f"[c]crop={even(sw_)}:{even(sh_)}:{even(sx)}:{even(sy)},scale={ow}:{oh}:flags=lanczos"
+                    f"{',cas=0.45' if SHARPEN else ''}")
+            head = f"{src}split=2[g][c];"
+        fc = (head +
+              f"[g]crop={even(gw)}:{gh}:{even(gx)}:{even(ay0)},scale={OUT_W}:{OUT_H}:flags=lanczos"
+              f"{',cas=0.35' if SHARPEN else ''}[bgv];"
+              f"{camf},pad=iw+16:ih+16:8:8:white[camv];"
+              f"[bgv][camv]overlay=W-w-36:140,setsar=1,fps={OUT_FPS},format=yuv420p")
+        cap_y = int(OUT_H * 0.72)
+    elif mode == "split":
         cx, cy, cw, ch = layout["cam"]
         fx, fy, fw, fh = layout["face"]
         cam_aspect = cw / max(ch, 1)
@@ -911,10 +1257,34 @@ def build_filter(layout, ass_name, src="[0:v]", zoom=None, dur=None, progress=Fa
         elif cx + cw / 2 <= W / 2 and gx < cx + cw and cx + cw + gw <= W * 0.92:
             gx = cx + cw
         gy = (H - gh) / 2
-        fc = (f"{src}split=2[g][c];"
-              f"[g]crop={even(gw)}:{even(gh)}:{even(gx)}:{even(gy)},scale={OUT_W}:{top_h}:flags=lanczos[top];"
-              f"[c]crop={even(w)}:{even(h)}:{even(x)}:{even(y)},scale={OUT_W}:{bot_h}:flags=lanczos[bot];"
-              f"[top][bot]vstack=inputs=2,setsar=1,fps={OUT_FPS},format=yuv420p")
+        game = (f"[g]crop={even(gw)}:{even(gh)}:{even(gx)}:{even(gy)},scale={OUT_W}:{top_h}:flags=lanczos"
+                f"{',cas=0.35' if SHARPEN else ''}[top];")
+        cap = MAX_CAM_UPSCALE
+        if cam_src:
+            # AI-upscaled cam frames (the cam box at cam_k x): real detail, so fill the full width again
+            k = cam_k
+            fc = (f"{src}null[g];" + game +
+                  f"{cam_src}crop={even(w * k)}:{even(h * k)}:{even((x - even(cx)) * k)}:{even((y - even(cy)) * k)},"
+                  f"scale={OUT_W}:{bot_h}:flags=lanczos[bot];"
+                  f"[top][bot]vstack=inputs=2,setsar=1,fps={OUT_FPS},format=yuv420p")
+        elif cap and OUT_W / w > cap:
+            # Small facecam overlays (often ~320px wide) turn to mush when stretched edge to edge. Show the whole
+            # cam box at most `cap`x over a blurred copy of itself instead: smaller, but sharp.
+            s = min(cap, OUT_W / cw, bot_h / ch)
+            fw_, fh_ = even(cw * s), even(ch * s)
+            fc = (f"{src}split=3[g][c][cb];" + game +
+                  f"[cb]crop={even(cw)}:{even(ch)}:{even(cx)}:{even(cy)},"
+                  f"scale={OUT_W}:{bot_h}:force_original_aspect_ratio=increase,crop={OUT_W}:{bot_h},"
+                  f"gblur=sigma=30,eq=brightness=-0.15[cbg];"
+                  f"[c]crop={even(cw)}:{even(ch)}:{even(cx)}:{even(cy)},scale={fw_}:{fh_}:flags=lanczos"
+                  f"{',cas=0.6' if SHARPEN else ''}[cfg];"
+                  f"[cbg][cfg]overlay=(W-w)/2:(H-h)/2[bot];"
+                  f"[top][bot]vstack=inputs=2,setsar=1,fps={OUT_FPS},format=yuv420p")
+        else:
+            fc = (f"{src}split=2[g][c];" + game +
+                  f"[c]crop={even(w)}:{even(h)}:{even(x)}:{even(y)},scale={OUT_W}:{bot_h}:flags=lanczos"
+                  f"{',cas=0.5' if SHARPEN else ''}[bot];"
+                  f"[top][bot]vstack=inputs=2,setsar=1,fps={OUT_FPS},format=yuv420p")
         cap_y = top_h
     elif mode == "track":
         fx, fy, fw, fh = layout["face"]
@@ -1018,6 +1388,202 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 # --------------------------------------------------------------------------------------
+# Meme version (--memes): emoji pops, meme text, shake and sound effects, only on the seconds that earned them.
+# Everything is generated locally (synth SFX, emoji drawn from the system's color emoji font).
+# --------------------------------------------------------------------------------------
+MEME_TEXT = {
+    "laugh":  ["LMAOOO", "I'M DEAD", "BHAI HASI BAND KAR", "HE'S CRYING"],
+    "shock":  ["BRO WHAT", "AYO??", "BHAI YE KYA THA", "NAH WAIT"],
+    "chat":   ["CHAT IS GOING CRAZY", "+1000 AURA", "W STREAMER"],
+    "action": ["NO SHOT", "FULL SEND", "CHAOS MODE"],
+    "rage":   ["RAGE MODE", "BHAI GUSSA HO GAYA"],
+    "sad":    ["EMOTIONAL DAMAGE", "IT'S OVER", "PAIN"],
+}
+MEME_EMOJI = {"laugh": "😂💀", "shock": "😳😱", "chat": "🔥", "action": "💥", "rage": "😡", "sad": "💀"}
+MEME_SFX = {"laugh": "pop", "shock": "boom", "chat": "ding", "action": "whoosh", "rage": "boom", "sad": "sad"}
+MEME_SHAKE = {"shock", "action", "rage"}
+
+
+def _synth_sfx(kind, sr=48000):
+    rng = np.random.default_rng(7)
+    if kind == "boom":          # deep sub drop with a click on top
+        t = np.arange(int(sr * 1.3)) / sr
+        f = 45 + 75 * np.exp(-t * 6)
+        x = np.sin(2 * np.pi * np.cumsum(f) / sr) * np.exp(-t * 2.6)
+        x[:int(sr * 0.012)] += rng.normal(0, 0.6, int(sr * 0.012))
+        x = np.tanh(2.2 * x)
+    elif kind == "whoosh":      # noise swelling through a sweeping low-pass
+        n = int(sr * 0.7)
+        noise = rng.normal(0, 1, n)
+        cut = np.linspace(0.02, 0.35, n) ** 1.5
+        y, acc = np.zeros(n), 0.0
+        for i in range(n):
+            acc += cut[i] * (noise[i] - acc)
+            y[i] = acc
+        x = y / (np.abs(y).max() + 1e-9) * np.sin(np.pi * np.arange(n) / n) ** 2
+    elif kind == "ding":
+        t = np.arange(int(sr * 0.9)) / sr
+        x = (np.sin(2 * np.pi * 1760 * t) + 0.4 * np.sin(2 * np.pi * 2640 * t)) * np.exp(-t * 5) * 0.7
+    elif kind == "pop":
+        t = np.arange(int(sr * 0.09)) / sr
+        x = np.sin(2 * np.pi * np.cumsum(500 + 9000 * t) / sr) * np.exp(-t * 40)
+    else:                       # "sad": four descending notes, wobble on the last one
+        out = []
+        for k, (f0, d) in enumerate([(392, .32), (370, .32), (349, .32), (330, .95)]):
+            t = np.arange(int(sr * d)) / sr
+            f = f0 * (1 + (0.025 * np.sin(2 * np.pi * 6 * t) if k == 3 else 0))
+            ph = 2 * np.pi * np.cumsum(f) / sr
+            note = sum(np.sin(h * ph) / h for h in range(1, 6))
+            env = np.minimum(1, t / 0.02) * np.minimum(1, (d - t) / 0.06)
+            out.append(note * env * 0.45)
+        x = np.concatenate(out)
+    return (np.clip(x, -1, 1) * 0.9 * 32767).astype(np.int16)
+
+
+def meme_assets(adir):
+    """Writes SFX wavs and emoji PNGs once into adir; returns {name: path}. Emoji need Pillow + a color emoji font."""
+    import wave
+    adir = Path(adir)
+    adir.mkdir(parents=True, exist_ok=True)
+    out = {}
+    for kind in set(MEME_SFX.values()):
+        p = adir / f"sfx_{kind}.wav"
+        if not p.exists():
+            with wave.open(str(p), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(48000)
+                wf.writeframes(_synth_sfx(kind).tobytes())
+        out[kind] = p
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        font_file = subprocess.run(["fc-match", "-f", "%{file}", "Noto Color Emoji"], capture_output=True,
+                                   text=True).stdout.strip()
+        font = ImageFont.truetype(font_file, 109)
+        for e in {ch for s in MEME_EMOJI.values() for ch in s}:
+            p = adir / f"emoji_{ord(e):x}.png"
+            if not p.exists():
+                im = Image.new("RGBA", (136, 128), (0, 0, 0, 0))
+                ImageDraw.Draw(im).text((0, 0), e, font=font, embedded_color=True)
+                im = im.crop(im.getbbox()).resize((230, 230), Image.LANCZOS)
+                im.save(p)
+            out[e] = p
+    except Exception as ex:   # no Pillow / no emoji font: memes still get text, shake and sound
+        log(f"memes: emoji unavailable ({ex.__class__.__name__}); text and sound only")
+    return out
+
+
+def plan_memes(clip, feats, to_out, max_events=3, spacing=4.0):
+    """Picks the seconds inside the clip that deserve a meme and what kind. to_out maps source t -> output t."""
+    z, lab, emo = feats["z"], feats["emo_label"], feats["emo"]
+    n = len(feats["E"])
+    cands = []
+    for i in range(max(0, int(clip.start)), min(n, int(clip.end))):
+        loud, bright = z["loud"][i], z["bright"][i]
+        s = {
+            "laugh": max((emo[i] + loud / 4) if lab[i] == "happy" and loud > 1.0 else 0,
+                         (z["chat_h"][i] / 3 + loud / 4) if z["chat_h"][i] > 2.0 and loud > 1.3 else 0),
+            "shock": max((emo[i] + max(0, loud) / 3) if lab[i] in ("surprised", "fear") else 0,
+                         loud / 2 if loud > 2.2 and bright > 1.5 else 0,
+                         feats["payoff"][i] / 1.5 if feats["payoff"][i] > 1.8 else 0),
+            "rage": (emo[i] + loud / 3) if lab[i] == "angry" and loud > 1.5 else 0,
+            "sad": emo[i] if lab[i] == "sad" and emo[i] > 0.6 else 0,
+            "chat": max(z["chat"][i], z["chat_h"][i]) / 2.5 if max(z["chat"][i], z["chat_h"][i]) > 2.5 else 0,
+            "action": z["game"][i] / 3 if z["game"][i] > 2.8 else 0,
+        }
+        kind = max(s, key=s.get)
+        if s[kind] > 0:
+            t = to_out(float(i) + 0.3)
+            if t is not None:
+                cands.append((s[kind], t, kind))
+    picked = []
+    rank = {"chat": 0.6, "action": 0.8}
+    for score, t, kind in sorted(cands, key=lambda c: -c[0] * rank.get(c[2], 1.0)):
+        if (len(picked) < max_events and all(abs(t - p[0]) >= spacing for p in picked)
+                and all(kind != p[1] for p in picked)):
+            picked.append((t, kind))
+    return sorted(picked)
+
+
+def write_meme_ass(path, events, y, font, seed):
+    hdr = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {OUT_W}
+PlayResY: {OUT_H}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Meme,{font},104,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,10,5,5,40,40,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    rng = np.random.default_rng(seed)
+    ev = []
+    for t, kind in events:
+        text = MEME_TEXT[kind][int(rng.integers(len(MEME_TEXT[kind])))]
+        color = {"rage": "&H3030FF&", "sad": "&HFFC080&", "chat": "&H00D4FF&"}.get(kind, "&HFFFFFF&")
+        tilt = int(rng.choice([-5, -3, 3, 5]))
+        anim = (f"{{\\pos({OUT_W // 2},{y})\\q2\\c{color}\\frz{tilt}\\fad(40,220)\\fscx35\\fscy35"
+                f"\\t(0,130,\\fscx118\\fscy118)\\t(130,240,\\fscx100\\fscy100)}}")
+        ev.append(f"Dialogue: 2,{ass_time(t)},{ass_time(t + 1.9)},Meme,,0,0,0,,{anim}{ass_escape(text)}")
+    Path(path).write_text(hdr + "\n".join(ev) + "\n", encoding="utf-8")
+
+
+def meme_filters(events, assets, n_inputs, text_y):
+    """Returns (video chain from [base] to [mv], extra input files, audio mix chain from [ca] to [cm])."""
+    inputs, vchain, achain, label = [], [], [], "base"
+    shakes = [t for t, k in events if k in MEME_SHAKE]
+    if shakes:
+        amp = "+".join(f"between(t,{t - 0.05:.2f},{t + 0.55:.2f})*(1-(t-{t - 0.05:.2f})/0.6)" for t in shakes)
+        vchain.append(f"[{label}]crop={OUT_W - 48}:{OUT_H - 86}:x='24+22*({amp})*sin(t*97)':"
+                      f"y='43+26*({amp})*cos(t*83)',scale={OUT_W}:{OUT_H}[shk]")
+        label = "shk"
+    for t, kind in events:
+        if kind == "sad":   # brief black-and-white moment
+            vchain.append(f"[{label}]hue=s=0:enable='between(t,{t:.2f},{t + 1.8:.2f})'[bw{len(vchain)}]")
+            label = f"bw{len(vchain) - 1}"
+        if kind == "rage":
+            vchain.append(f"[{label}]colorbalance=rs=0.35:gs=-0.1:bs=-0.1:"
+                          f"enable='between(t,{t:.2f},{t + 1.2:.2f})'[rg{len(vchain)}]")
+            label = f"rg{len(vchain) - 1}"
+    sides = [(OUT_W * 0.16, -1), (OUT_W * 0.84, 1)]
+    for j, (t, kind) in enumerate(events):
+        for k, e in enumerate(MEME_EMOJI[kind]):
+            if e not in assets:
+                continue
+            idx = n_inputs + len(inputs)
+            inputs.append(assets[e])
+            cx, _ = sides[(j + k) % 2]
+            t0 = t + 0.08 * k
+            # pops up from below, overshoots, then bobs while visible
+            y = (f"{text_y - 330}+260*max(0,1-(t-{t0:.2f})/0.16)-30*sin(min(1,max(0,(t-{t0:.2f})/0.16))*PI)"
+                 f"+12*sin((t-{t0:.2f})*9)")
+            vchain.append(f"[{label}][{idx}:v]overlay=x={cx - 115:.0f}:y='{y}':"
+                          f"enable='between(t,{t0:.2f},{t0 + 1.7:.2f})'[em{idx}]")
+            label = f"em{idx}"
+    vchain.append(f"[{label}]null[mv]")
+    sfx = [(t, MEME_SFX[kind]) for t, kind in events if MEME_SFX.get(kind) in assets]
+    mix = ["[ca]aformat=sample_rates=48000:channel_layouts=stereo[ca0]"]
+    for j, (t, kind) in enumerate(sfx):
+        idx = n_inputs + len(inputs)
+        inputs.append(assets[kind])
+        ms = max(0, int(t * 1000) - (40 if kind == "boom" else 0))
+        vol = {"boom": 0.9, "sad": 0.55, "ding": 0.35, "pop": 0.5, "whoosh": 0.45}[kind]
+        mix.append(f"[{idx}:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay={ms}|{ms},"
+                   f"volume={vol}[fx{j}]")
+    if sfx:
+        mix.append("[ca0]" + "".join(f"[fx{j}]" for j in range(len(sfx)))
+                   + f"amix=inputs={len(sfx) + 1}:normalize=0:duration=first[cm]")
+    else:
+        mix.append("[ca0]anull[cm]")
+    achain += mix
+    return vchain, inputs, achain
+
+
+# --------------------------------------------------------------------------------------
 # Roman (Latin-letter) captions: Hindi/Urdu speech is transcribed as Hindi and romanised.
 # --------------------------------------------------------------------------------------
 _DEV_CONS = {"क": "k", "ख": "kh", "ग": "g", "घ": "gh", "ङ": "n", "च": "ch", "छ": "chh", "ज": "j", "झ": "jh",
@@ -1033,7 +1599,15 @@ _DEV_MATRA = {"ा": "a", "ि": "i", "ी": "i", "ु": "u", "ू": "u", "े":
 _DEV_FIX = {"hai": "hai", "nahin": "nahi", "men": "mein", "main": "main", "han": "haan", "yah": "yeh",
             "vah": "woh", "vo": "woh", "ham": "hum", "hamne": "humne", "kahin": "kahin", "yahan": "yahan",
             "vahan": "wahan", "sirph": "sirf", "bat": "baat", "achchha": "acha", "achchhi": "achi", "kyon": "kyun",
-            "par": "par", "tha": "tha", "aur": "aur", "kya": "kya", "bhai": "bhai"}
+            "par": "par", "tha": "tha", "aur": "aur", "kya": "kya", "bhai": "bhai",
+            # English words spoken inside Hindi/Urdu come back spelled by sound
+            "lie": "liye", "pulis": "police", "kating": "cutting", "gem": "game", "misan": "mission",
+            "lusiya": "Lucia", "vais": "Vice", "siti": "City", "plen": "plan",
+            "strim": "stream", "chat": "chat", "kalip": "clip", "baik": "bike", "gadi": "gaadi",
+            "laind": "land", "lainding": "landing", "puls": "police", "phresh": "fresh", "philing": "feeling",
+            "biliyan": "billion", "miliyan": "million", "mishan": "mission", "plen": "plane",
+            "lending": "landing", "taiksi": "taxi", "predikshan": "prediction", "prediksan": "prediction",
+            "leval": "level", "levl": "level", "graphiks": "graphics", "graphiksa": "graphics"}
 
 
 def romanize(word):
@@ -1094,9 +1668,11 @@ class Renderer:
     def __init__(self, outdir, args):
         self.outdir = Path(outdir)
         self.args = args
-        self.enc = pick_encoder()
+        self.enc_pre, self.enc_vf, self.enc = pick_encoder()
         self.last_layout = None
-        self.count = len(list(self.outdir.glob("*.mp4")))
+        # continue after the highest clip number already in the folder (meme versions share their clip's number)
+        nums = [int(m.group(1)) for f in self.outdir.glob("*.mp4") if (m := re.match(r"(\d+)_", f.name))]
+        self.count = max(nums, default=0)
 
     def plan_edit(self, clip, tl, feats):
         """Source intervals in output order. Removes dead air (jump cuts) and prepends a teaser of the peak."""
@@ -1148,43 +1724,62 @@ class Renderer:
                 self._gem_ok = {}
         return self._gem
 
+    WHO = ("streamer", "key_character", "background", "not_spoken")
+
     def gemini_fix(self, audio, rough):
-        """Gemini listens to the clip and corrects each word (by index, so Whisper's timings stay attached).
-        Returns list of corrected words (same length, '' = drop) or None when it isn't sure."""
-        import io
-        import wave
+        """Gemini listens to the clip, corrects each word (by index, so Whisper's timings stay attached) and says who
+        speaks it. Returns (words, who, title, model): words = corrected text per index ('' = drop), who = one of
+        WHO per index; (None, None, '', model) when it isn't sure."""
         from google.genai import types
         from pydantic import BaseModel
 
         class Item(BaseModel):
             i: int
             w: str
+            who: str
 
         class Out(BaseModel):
             confident: bool
             title: str
             words: list[Item]
 
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(SR)
-            wf.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+        # group the word list into sentences (by punctuation / length) so Gemini labels whole lines, not words
+        lines, cur = [], []
+        for i, w in enumerate(rough):
+            cur.append(f"{i}:{w}")
+            if w.endswith((".", "?", "!")) or len(cur) >= 12:
+                lines.append(" ".join(cur))
+                cur = []
+        if cur:
+            lines.append(" ".join(cur))
         prompt = (
-            "This audio is from a live streamer. They may speak English, Hindi/Urdu, or Hinglish (both mixed in one "
-            "sentence). Below is a rough automatic word list, one word per index, in time order.\n"
-            "Listen to the audio and return the corrected word for EVERY index (same index numbers), written the way "
-            "people type casually: English words in normal English spelling (brightness, unlock, Vice City, road, "
-            "mission), Hindi/Urdu words in Roman letters (nahi, hai, kya, bhai, mere khyal se). Latin letters only - "
-            "never Devanagari or Urdu script. Do not translate. Do not add, merge or reorder indexes. If an index was "
-            "not actually spoken, return an empty string for it.\n"
+            "This audio is from a live stream: the STREAMER talks into their own microphone while a game or video "
+            "plays, and the game's characters talk too. The streamer may speak English, Hindi/Urdu, or Hinglish "
+            "(both mixed in one sentence). Below is a rough automatic transcript of EVERYTHING that was heard, as "
+            "numbered words grouped into lines.\n\n"
+            "Decide who speaks each LINE (give every word of a sentence the same label unless the speaker clearly "
+            "changes mid-line):\n"
+            "- 'streamer': the streamer's own mic voice. Clues: close, dry, slightly compressed mic sound, often "
+            "talking OVER the game audio; reacting, laughing, screaming, commenting, talking to chat ('chat', 'bro', "
+            "'yo', 'what'), reading or answering chat.\n"
+            "- 'key_character': a game/video character whose line matters for this moment (the setup or punchline the "
+            "streamer reacts to). Clues: polished voice-acted/cinematic sound, music or ambience under it, reverb of "
+            "the scene, and characters answering EACH OTHER in a scripted back-and-forth conversation.\n"
+            "- 'background': any other game/video dialogue, NPC chatter, song lyrics, ads, text-to-speech donations "
+            "or music.\n"
+            "- 'not_spoken': the word was not actually said (then w = '').\n"
+            "A cutscene conversation between characters is NOT the streamer, even when it is in English and the "
+            "streamer is English-speaking. If you really cannot tell a line apart, use 'streamer'.\n\n"
+            "For EVERY word index (same index numbers) also return w, the corrected word, written the way people type "
+            "casually: English words in normal English spelling (brightness, unlock, Vice City, chat), Hindi/Urdu "
+            "words in Roman letters (nahi, hai, kya, bhai, mere khyal se). Latin letters only - never Devanagari or "
+            "Urdu script. Do not translate. Do not add, merge or reorder indexes.\n"
             "Set confident=false if the speech is unclear, drowned out by game audio or music, or you cannot verify "
             "most of the words - wrong captions are worse than none.\n"
             "Also give a short catchy title for this clip (max 6 words, same language style).\n\n"
-            + "\n".join(f"{i}: {w}" for i, w in enumerate(rough)))
+            + "\n".join(lines))
         client = self._gemini()
-        part = types.Part.from_bytes(data=buf.getvalue(), mime_type="audio/wav")
+        part = types.Part.from_bytes(data=wav_bytes(audio), mime_type="audio/wav")
         cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=Out, temperature=0)
         now = time.time()
         for model in self.GEMINI_MODELS:
@@ -1197,60 +1792,101 @@ class Renderer:
                 log(f"gemini {model} unavailable ({e.__class__.__name__}); trying next")
                 continue
             if o is None or not o.confident:
-                return None, "", model
-            fixed = [None] * len(rough)
+                return None, None, "", model
+            fixed, who = [None] * len(rough), ["not_spoken"] * len(rough)
             for it in o.words:
                 if 0 <= it.i < len(rough) and fixed[it.i] is None:
                     fixed[it.i] = it.w.strip()
+                    who[it.i] = it.who if it.who in self.WHO else "background"
             if sum(f is None for f in fixed) > 0.1 * len(rough):
-                return None, "", model
-            return ["" if f is None else f for f in fixed], o.title.strip(), model
-        return None, "", "none"
+                return None, None, "", model
+            return ["" if f is None else f for f in fixed], who, o.title.strip(), model
+        return None, None, "", "none"
+
+    def transcribe_clip(self, audio, lang):
+        """Word timings for the clip: Whisper large-v3 on Groq when GROQ_API_KEY is set (more accurate, and no
+        1.5 GB model in RAM), else the local caption model. Returns ([(start, end, text, prob)], language)."""
+        a = self.args
+        if a.caption_asr != "local":
+            import groq_client
+            if groq_client.api_key():
+                try:
+                    words, segs, model = groq_client.transcribe(wav_bytes(audio), language=lang)
+                    out = []
+                    for w in words:
+                        sg = next((g for g in segs if g.get("start", 0) - 0.05 <= w["start"] <= g.get("end", 0) + 0.05),
+                                  None)
+                        if sg and sg.get("no_speech_prob", 0) > 0.6:
+                            continue
+                        prob = math.exp(sg["avg_logprob"]) if sg and "avg_logprob" in sg else 0.7
+                        if w.get("word", "").strip():
+                            out.append((float(w["start"]), float(w["end"]), w["word"].strip(), prob))
+                    if not getattr(self, "_groq_asr_logged", False):
+                        self._groq_asr_logged = True
+                        log(f"captions: transcribing on Groq ({model})")
+                    return out, lang or "auto"
+                except groq_client.GroqError as e:
+                    log(f"captions: Groq transcription unavailable ({str(e)[:100]}); using the local model")
+            elif a.caption_asr == "groq":
+                log("captions: --caption-asr groq needs GROQ_API_KEY; using the local model")
+        segs, det = self._caption_model().transcribe(
+            audio, word_timestamps=True, vad_filter=True, beam_size=3, language=lang,
+            condition_on_previous_text=False)
+        return [(w.start, w.end, w.word.strip(), w.probability)
+                for sg in segs for w in (sg.words or []) if w.word.strip()], det.language
 
     def make_captions(self, audio, work, cap_y, dur, clip):
-        """Captions are only burned in when BOTH Whisper (timing) and Gemini (listening check) are confident.
-        Anything doubtful -> clean clip with no captions."""
+        """Captions only for what the STREAMER says (plus game/video lines that matter for the moment), in English
+        or Roman Urdu/Hindi. Burned in only when Whisper (timing) and Gemini (listening: words + who speaks) are both
+        confident. Anything doubtful -> clean clip with no captions."""
         a = self.args
         words, info = [], "off"
-        if a.captions and audio is not None and len(audio) > SR:
-            if not self._gemini():
-                return None, "off (no GEMINI_API_KEY)"
-
-            def run(lang):
-                segs, det = self._caption_model().transcribe(
-                    audio, word_timestamps=True, vad_filter=True, beam_size=3, language=lang,
-                    condition_on_previous_text=False)
-                return [w for sg in segs for w in (sg.words or []) if w.word.strip()], det.language
+        listener = bool(self._gemini())
+        if a.captions and not listener:
+            info = "skipped (no GEMINI_API_KEY to check who speaks)"
+            if not getattr(self, "_nolisten_warned", False):
+                self._nolisten_warned = True
+                log("captions: need GEMINI_API_KEY - Gemini listens to tell the streamer apart from game "
+                    "dialogue; without it clips stay uncaptioned")
+        if a.captions and listener and audio is not None and len(audio) > SR:
             try:
-                raw, det_lang = run(a.caption_lang or getattr(self, "_cap_lang", None))
+                raw, det_lang = self.transcribe_clip(audio, a.caption_lang or getattr(self, "_cap_lang", None))
                 # Urdu comes out in Arabic script, which can't be romanised (no vowels): re-listen as Hindi.
-                if any(re.search(r"[؀-ۿ]", w.word) for w in raw):
+                if any(re.search(r"[\u0600-\u06ff]", w[2]) for w in raw):
                     self._cap_lang = "hi"
-                    raw, det_lang = run("hi")
+                    raw, det_lang = self.transcribe_clip(audio, "hi")
             except Exception as e:
                 log(f"caption transcription failed: {e}")
                 raw, det_lang = [], "?"
-            conf = float(np.mean([w.probability for w in raw])) if raw else 0.0
+            conf = float(np.mean([w[3] for w in raw])) if raw else 0.0
             if not raw:
                 info = "no speech"
             elif conf < a.caption_conf:
                 info = f"skipped (timing confidence {conf:.2f} < {a.caption_conf})"
             else:
-                rough = [romanize(w.word.strip()) or "?" for w in raw]
+                rough = [romanize(w[2]) or "?" for w in raw]
                 try:
-                    fixed, title, model = self.gemini_fix(audio, rough)
+                    fixed, who, title, model = self.gemini_fix(audio, rough)
                 except Exception as e:
                     log(f"gemini error: {e.__class__.__name__}: {str(e)[:120]}")
-                    fixed, title, model = None, "", "error"
+                    fixed, who, title, model = None, None, "", "error"
                 if fixed is None:
                     info = f"skipped (Gemini not confident / unavailable: {model})"
                 else:
-                    pairs = [(w, f) for w, f in zip(raw, fixed) if f]
-                    if (len(pairs) < 0.7 * len(raw) or not all(f.isascii() for _, f in pairs)):
-                        info = "skipped (too many unverified words)"
+                    spoken = [k for k in range(len(raw)) if who[k] != "not_spoken" and fixed[k]]
+                    keep = [k for k in spoken if who[k] in ("streamer", "key_character")]
+                    n_bg = sum(who[k] == "background" for k in spoken)
+                    if len(spoken) < 0.6 * len(raw):
+                        info = "skipped (most of the transcript was not really spoken)"
+                    elif not all(fixed[k].isascii() for k in keep):
+                        info = "skipped (non-Latin words left)"
+                    elif not keep:
+                        info = f"no streamer speech ({n_bg} background words left out)"
                     else:
-                        words = [Word(w.start, w.end, f) for w, f in pairs]
-                        info = f"{model} verified, {len(words)} words"
+                        words = [Word(raw[k][0], raw[k][1], fixed[k]) for k in keep]
+                        n_ch = sum(who[k] == "key_character" for k in keep)
+                        info = (f"{model} verified, {len(words)} words (streamer {len(words) - n_ch}, "
+                                f"character {n_ch}; {n_bg} background words left out)")
                         if title and not clip.title and title.isascii():
                             clip.title = title
         if not words and not clip.hook:
@@ -1271,7 +1907,8 @@ class Renderer:
                     break
                 clip, tl, feats = item
                 try:
-                    out = self.render(clip, tl, feats)
+                    with render_turn():
+                        out = self.render(clip, tl, feats)
                     self.on_done(clip, out)
                 except Exception as e:
                     log(f"render error: {e.__class__.__name__}: {e}")
@@ -1286,6 +1923,83 @@ class Renderer:
     def finish(self):
         self.q.join()
         self.q.put(None)
+
+    def ai_cam_frames(self, work, vparts, layout, out_dur):
+        """Export the clip's facecam box at native size and upscale it 4x with Real-ESRGAN (GPU, Vulkan).
+        Returns the folder of upscaled frames, or None (tool missing / failed) to fall back to normal scaling."""
+        exe = HERE / "tools" / "realesrgan" / "realesrgan-ncnn-vulkan"
+        if not exe.exists():
+            if not getattr(self, "_ai_cam_warned", False):
+                self._ai_cam_warned = True
+                log("ai-cam: tools/realesrgan/realesrgan-ncnn-vulkan not found; using normal scaling")
+            return None
+        cx, cy, cw, ch = layout["cam"]
+        din, dout = (work / "cam_in").resolve(), (work / "cam_out").resolve()   # ffmpeg runs with cwd=work
+        for d in (din, dout):
+            d.mkdir(exist_ok=True)
+            for f in d.glob("*.png"):
+                f.unlink()
+        (work / "camfilter.txt").write_text(with_teaser_index(";".join(
+            vparts + [f"[cv]crop={even(cw)}:{even(ch)}:{even(cx)}:{even(cy)},fps={OUT_FPS}[cam]"]), 1))
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt",
+                            *getattr(self, "_teaser_in", []), FILTER_SCRIPT, "camfilter.txt", "-map", "[cam]", str(din / "%06d.png")],
+                           cwd=work, capture_output=True, text=True)
+        n = len(list(din.glob("*.png")))
+        if r.returncode != 0 or not n:
+            log(f"ai-cam: frame export failed: {r.stderr.strip()[-200:]}")
+            return None
+        t0 = time.time()
+        r = subprocess.run([str(exe), "-i", str(din), "-o", str(dout), "-n", "realesrgan-x4plus", "-s", "4",
+                            "-m", str(exe.parent / "models"), "-f", "png"], capture_output=True, text=True)
+        m = len(list(dout.glob("*.png")))
+        if r.returncode != 0 or m != n:
+            log(f"ai-cam: upscaling failed ({m}/{n} frames): {r.stderr.strip()[-200:]}")
+            return None
+        log(f"ai-cam: upscaled {n} facecam frames in {time.time() - t0:.0f}s")
+        for f in din.glob("*.png"):
+            f.unlink()
+        return dout
+
+    def render_meme(self, clip, feats, layout, cuts, first_main, zoom, out_dur, vparts, aparts, has_audio,
+                    ass, cap_y, work, name, encode):
+        if feats is None:
+            return [], ""
+        events = plan_memes(clip, feats, lambda t: self.map_time(t, cuts, first_main))
+        tp = self.map_time(clip.peak, cuts, first_main)
+        if tp is not None and not any(abs(t - tp) < 2.5 for t, _ in events):
+            # the moment the clip was cut for always gets one, typed by what fired there
+            r = " ".join(clip.reasons)
+            kind = ("shock" if any(w in r for w in ("scream", "surprised", "fear", "payoff", "volume")) else
+                    "laugh" if "happy" in r else "rage" if "angry" in r else
+                    "chat" if "chat" in r else "action" if "action" in r else "shock")
+            # one meme per kind: the peak's meme replaces a same-kind one elsewhere in the clip
+            events = sorted([e for e in events if e[1] != kind] + [(tp + 0.2, kind)])[:4]
+        if not events:
+            return [], ""
+        if getattr(self, "_meme_assets", None) is None:
+            self._meme_assets = meme_assets((self.outdir / ".work" / "meme_assets").resolve())
+        text_y = (int(cap_y * 0.42) if layout["mode"] == "split" else 1060 if layout["mode"] == "float"
+                  else int(OUT_H * 0.3))
+        write_meme_ass(work / "memes.ass", events, text_y, self.args.font, seed=int(clip.start))
+        base_fc, _ = build_filter(layout, None, src="[cv]", zoom=zoom, dur=out_dur, progress=not self.args.no_progress,
+                                  cam_src=self._cam[0])
+        assert base_fc.endswith("[v]")
+        base_fc = base_fc[:-3] + "[base]"
+        vchain, extra, achain = meme_filters(events, self._meme_assets, 2 if self._cam[0] else 1, text_y)
+        subs = (f"ass={ass}," if ass else "") + "ass=memes.ass"
+        parts = vparts + [base_fc] + vchain + [f"[mv]{subs}[v]"]
+        if has_audio:
+            parts += aparts + achain + ["[cm]loudnorm=I=-14:TP=-1.5:LRA=11[ao]"]
+        vout = "[v]"
+        if self.enc_vf:
+            parts.append(f"[v]{self.enc_vf}[venc]")
+            vout = "[venc]"
+        (work / "filter_meme.txt").write_text(";".join(parts))
+        out = self.outdir / f"{name}_meme.mp4"
+        if not encode("filter_meme.txt", out, vout, extra):
+            return events, ""
+        log(f"MEME {out.name}  " + ", ".join(f"{k}@{t:.1f}s" for t, k in events))
+        return events, out.name
 
     @staticmethod
     def map_time(t, cuts, first):
@@ -1308,11 +2022,14 @@ class Renderer:
         (work / "list.txt").write_text("".join(f"file '{s.path}'\n" for s in segs))
 
         layout = None
+        frames = sample_frames([s.path for s in segs], n=10) if self.args.layout != "blur" else []
         if self.args.layout != "blur":
-            layout = detect_layout(sample_frames([s.path for s in segs], n=10))
+            layout = detect_layout(frames)
             known = self.last_layout or tl.layout
-            if layout and self.args.layout in ("split", "track") and layout["mode"] != self.args.layout:
-                layout = known if known and known["mode"] == self.args.layout else layout
+            layout = steadier_layout(layout, known) if layout and layout["mode"] == "split" else layout
+            want = "split" if self.args.layout == "float" else self.args.layout   # float renders a split layout
+            if layout and want in ("split", "track") and layout["mode"] != want:
+                layout = known if known and known["mode"] == want else layout
             if (layout is None or layout["mode"] == "blur") and known and known["mode"] == "split":
                 layout = known  # streamer looked away; keep the known facecam box
         if layout is None:
@@ -1322,6 +2039,11 @@ class Renderer:
             layout = {"mode": "blur", "W": int(wh[0]) if wh[0] else 1920, "H": int(wh[1]) if len(wh) > 1 else 1080}
         if layout["mode"] != "blur":
             self.last_layout = layout
+        # what the viewer sees: facecam streams default to full-screen gameplay + floating cam
+        rlay = ({**layout, "mode": "float"} if layout["mode"] == "split" and self.args.layout in ("auto", "float")
+                else layout)
+        if rlay["mode"] == "float":   # cutscene bars come and go, so measure them for this clip only
+            rlay["active"] = letterbox_rows(frames) or (0, rlay["H"])
 
         has_audio = bool(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
                                          "stream=index", "-of", "csv=p=0", segs[0].path],
@@ -1359,58 +2081,106 @@ class Renderer:
 
         base = segs[0].t0
         n = len(cuts)
+        main = list(range(first_main, n))   # cuts[0] is the teaser when first_main == 1
+        m = len(main)
         vparts, aparts = [], []
-        vl = "".join(f"[s{k}]" for k in range(n))
-        vparts.append(f"[0:v]split={n}{vl}" if n > 1 else "[0:v]null[s0]")
+        vl = "".join(f"[s{k}]" for k in main)
+        vparts.append(f"[0:v]split={m}{vl}" if m > 1 else f"[0:v]null[s{main[0]}]")
         # aresample=async fills any gap in the recorded audio with silence instead of sliding it out of sync
-        al = "".join(f"[r{k}]" for k in range(n))
-        aparts.append(f"[0:a]aresample=async=1:first_pts=0," + (f"asplit={n}{al}" if n > 1 else "anull[r0]"))
+        al = "".join(f"[r{k}]" for k in main)
+        aparts.append(f"[0:a]aresample=async=1:first_pts=0," + (f"asplit={m}{al}" if m > 1 else f"anull[r{main[0]}]"))
+        self._teaser_in = []
         for k, (a0, b0) in enumerate(cuts):
             ra, rb = max(0.0, a0 - base), b0 - base
             ln = rb - ra
+            fade = f"afade=t=in:d=0.03,afade=t=out:st={max(0, ln - 0.04):.3f}:d=0.04[ta{k}]"
+            if k < first_main:
+                # The teaser (peak first) is decoded from its own seeked input. Taking it from the shared split
+                # made ffmpeg hold every raw frame between the clip start and the peak in RAM until the teaser
+                # was done (~190 MB per second at 1080p60: 2-3 GB per render, more for long clips).
+                self._teaser_in = ["-ss", f"{ra:.3f}", "-t", f"{ln:.3f}", "-f", "concat", "-safe", "0",
+                                   "-i", "list.txt"]
+                vparts.append(f"[{TEASER_IN}:v]setpts=PTS-STARTPTS[tv{k}]")
+                aparts.append(f"[{TEASER_IN}:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS,{fade}")
+                continue
             vparts.append(f"[s{k}]trim=start={ra:.3f}:end={rb:.3f},setpts=PTS-STARTPTS[tv{k}]")
-            aparts.append(f"[r{k}]atrim=start={ra:.3f}:end={rb:.3f},asetpts=PTS-STARTPTS,"
-                          f"afade=t=in:d=0.03,afade=t=out:st={max(0, ln - 0.04):.3f}:d=0.04[ta{k}]")
+            aparts.append(f"[r{k}]atrim=start={ra:.3f}:end={rb:.3f},asetpts=PTS-STARTPTS,{fade}")
         vparts.append("".join(f"[tv{k}]" for k in range(n)) + f"concat=n={n}:v=1:a=0[cv]")
         aparts.append("".join(f"[ta{k}]" for k in range(n)) + f"concat=n={n}:v=0:a=1[ca]")
 
-        _, cap_y = build_filter(layout, None)
+        cam_src, cam_inputs = None, []
+        if getattr(self.args, "ai_cam", False) and layout["mode"] == "split":
+            cam_dir = self.ai_cam_frames(work, vparts, layout, out_dur)
+            if cam_dir:
+                cam_src = "[1:v]"
+                cam_inputs = ["-framerate", str(OUT_FPS), "-i", str(cam_dir / "%06d.png")]
+        self._cam = (cam_src, cam_inputs)
+        _, cap_y = build_filter(rlay, None)
         ass, cap_info = None, "off"
         if self.args.captions or clip.hook:
             audio = None
             if has_audio and self.args.captions:
-                (work / "afilter.txt").write_text(";".join(aparts))
+                (work / "afilter.txt").write_text(with_teaser_index(";".join(aparts), 1))
                 raw = subprocess.run(["ffmpeg", "-v", "error", "-f", "concat", "-safe", "0", "-i", "list.txt",
-                                      "-filter_complex_script", "afilter.txt", "-map", "[ca]", "-ac", "1",
+                                      *self._teaser_in, FILTER_SCRIPT, "afilter.txt", "-map", "[ca]", "-ac", "1",
                                       "-ar", str(SR), "-f", "f32le", "-"], cwd=work, capture_output=True).stdout
                 audio = np.frombuffer(raw, dtype=np.float32).copy()
             ass, cap_info = self.make_captions(audio, work, cap_y, out_dur, clip)
 
-        lay_fc, _ = build_filter(layout, ass, src="[cv]", zoom=zoom, dur=out_dur, progress=not self.args.no_progress)
+        lay_fc, _ = build_filter(rlay, ass, src="[cv]", zoom=zoom, dur=out_dur, progress=not self.args.no_progress,
+                                 cam_src=cam_src)
         parts = vparts + [lay_fc]
         if has_audio:
             parts += aparts + ["[ca]loudnorm=I=-14:TP=-1.5:LRA=11[ao]"]
+        vout = "[v]"
+        if self.enc_vf:   # e.g. upload frames to the GPU for VAAPI
+            parts.append(f"[v]{self.enc_vf}[venc]")
+            vout = "[venc]"
         (work / "filter.txt").write_text(";".join(parts))
 
+        def encode(script, out, vlabel, extra=()):
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *self.enc_pre, "-f", "concat", "-safe", "0",
+                   "-i", "list.txt", *self._cam[1]]
+            for p in extra:
+                cmd += ["-i", str(p)]
+            if self._teaser_in:   # the teaser's own input goes last; point the filter script at its index
+                idx = 1 + (1 if self._cam[1] else 0) + len(extra)
+                run_script = script + ".run"
+                (work / run_script).write_text(with_teaser_index((work / script).read_text(), idx))
+                cmd += self._teaser_in
+                script = run_script
+            cmd += [FILTER_SCRIPT, script, "-map", vlabel]
+            if has_audio:
+                cmd += ["-map", "[ao]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+            cmd += [*self.enc, "-movflags", "+faststart", str(out.resolve())]
+            r = subprocess.run(cmd, cwd=work, capture_output=True, text=True)
+            if r.returncode != 0:
+                log(f"render failed ({out.name}): {r.stderr.strip()[-500:]}")
+                return False
+            return True
+
         out = self.outdir / f"{name}.mp4"
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
-               "-i", "list.txt", "-filter_complex_script", "filter.txt", "-map", "[v]"]
-        if has_audio:
-            cmd += ["-map", "[ao]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
-        cmd += [*self.enc, "-movflags", "+faststart", str(out.resolve())]
-        r = subprocess.run(cmd, cwd=work, capture_output=True, text=True)
-        if r.returncode != 0:
-            log(f"render failed: {r.stderr.strip()[-500:]}")
+        if not encode("filter.txt", out, vout):
             return None
+
+        memes, meme_file = [], ""
+        if self.args.memes:
+            try:
+                memes, meme_file = self.render_meme(clip, feats, rlay, cuts, first_main, zoom, out_dur,
+                                                    vparts, aparts, has_audio, ass, cap_y, work, name, encode)
+            except Exception as e:
+                log(f"meme version failed: {e.__class__.__name__}: {e}")
         clip.file = out.name
         old = clip.replaces
         clip.replaces = old.file if old is not None else ""
         if old is not None and old.file:   # regenerated as one longer clip -> drop the overlapping older one
-            for ext in (".mp4", ".json"):
-                (self.outdir / old.file).with_suffix(ext).unlink(missing_ok=True)
+            stem = Path(old.file).stem
+            for f in (f"{stem}.mp4", f"{stem}.json", f"{stem}_meme.mp4"):
+                (self.outdir / f).unlink(missing_ok=True)
             log(f"merged with previous moment -> replaced {old.file}")
-        meta = {**asdict(clip), "layout": layout["mode"], "duration": round(out_dur, 2),
-                "captions": cap_info, "fps": OUT_FPS,
+        meta = {**asdict(clip), "layout": rlay["mode"], "duration": round(out_dur, 2),
+                "captions": cap_info, "fps": OUT_FPS, "meme_file": meme_file, "ai_cam": bool(self._cam[0]),
+                "memes": [{"t": round(t, 2), "kind": k} for t, k in memes],
                 "source_span": [round(clip.start, 2), round(clip.end, 2)], "jump_cuts": n - 1 - first_main,
                 "teaser": round(teaser, 2),
                 "transcript": " ".join(w.text for w in tl.words_between(clip.start, clip.end)),
@@ -1418,6 +2188,9 @@ class Renderer:
         (self.outdir / f"{name}.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str))
         with open(self.outdir / "clips.jsonl", "a", encoding="utf-8") as fh:
             fh.write(json.dumps(meta, ensure_ascii=False, default=str) + "\n")
+        if self._cam[0]:   # upscaled frames are ~3 GB per 20s clip: drop them once encoded
+            import shutil
+            shutil.rmtree(work / "cam_out", ignore_errors=True)
         return out
 
 
@@ -1429,10 +2202,11 @@ def main():
     ap = argparse.ArgumentParser(description="Record a live stream and keep cutting vertical viral clips.")
     ap.add_argument("source", help="live stream URL (YouTube/Twitch/Kick/...), VOD URL, or local video file")
     ap.add_argument("--out", default="clips", help="output folder for clips")
-    ap.add_argument("--min-len", type=float, default=12)
-    ap.add_argument("--max-len", type=float, default=45)
+    ap.add_argument("--min-len", type=float, default=15)
+    ap.add_argument("--max-len", type=float, default=75,
+                    help="clips grow with the moment (build-up + reaction) up to this length")
     ap.add_argument("--min-gap", type=float, default=12, help="min seconds between clips")
-    ap.add_argument("--target-per-hour", type=float, default=30,
+    ap.add_argument("--target-per-hour", type=float, default=12,
                     help="rate controller: lowers the bar when clips come slower than this")
     ap.add_argument("--merge-off", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--setup", type=float, default=7, help="seconds of context before a moment")
@@ -1443,10 +2217,24 @@ def main():
     ap.add_argument("--no-teaser", action="store_true", help="don't open with a 2s flash of the peak")
     ap.add_argument("--no-zoom", action="store_true")
     ap.add_argument("--no-progress", action="store_true")
-    ap.add_argument("--threshold", type=float, default=1.0, help="absolute engagement floor")
-    ap.add_argument("--percentile", type=float, default=85,
+    ap.add_argument("--cam-upscale", type=float, default=2.4,
+                    help="max enlargement of a small facecam overlay; beyond it the cam is shown smaller over a "
+                         "blurred fill so it stays sharp (0 = always stretch to full width)")
+    ap.add_argument("--no-sharpen", action="store_true", help="skip the light sharpening of the clip panels")
+    ap.add_argument("--ai-cam", action="store_true",
+                    help="upscale the facecam 4x with Real-ESRGAN (tools/realesrgan, GPU via Vulkan) - much sharper, "
+                         "but slow (~1s per frame on a mid-range GPU): best for re-rendering chosen clips")
+    ap.add_argument("--threshold", type=float, default=3.5,
+                    help="absolute excitement floor: calm stretches produce no clips at all")
+    ap.add_argument("--percentile", type=float, default=90,
                     help="only peaks above this percentile of the stream so far become clips")
-    ap.add_argument("--layout", choices=["auto", "split", "track", "blur"], default="auto")
+    ap.add_argument("--min-percentile", type=float, default=85,
+                    help="the rate controller never lowers the bar below this percentile")
+    ap.add_argument("--warmup", type=float, default=180,
+                    help="seconds of stream to watch before the first clip (learns the streamer's normal)")
+    ap.add_argument("--layout", choices=["auto", "float", "split", "track", "blur"], default="auto",
+                    help="auto: facecam streams -> float (full-screen gameplay + floating cam); split = gameplay top, "
+                         "cam bottom; track = follow the face (IRL); blur = 4:3 on blurred background")
     ap.add_argument("--whisper", default="base", help="faster-whisper model (tiny/base/small/medium) or 'none'")
     ap.add_argument("--language", default=None, help="force transcript language, e.g. en, hi, ur")
     ap.add_argument("--captions", action="store_true",
@@ -1455,19 +2243,31 @@ def main():
     ap.add_argument("--caption-model", default="large-v3-turbo",
                     help="Whisper model used only for the final captions (accuracy matters here)")
     ap.add_argument("--caption-lang", default=None, help="force caption language (e.g. en, hi, ur)")
+    ap.add_argument("--caption-asr", choices=["auto", "groq", "local"], default="auto",
+                    help="who transcribes the captions: Whisper large-v3 on Groq (auto = when GROQ_API_KEY is set), "
+                         "or the local --caption-model")
     ap.add_argument("--caption-min-prob", type=float, default=0.5, help="hide words below this confidence")
     ap.add_argument("--font", default="Arial Black")
+    ap.add_argument("--memes", action="store_true",
+                    help="also write NNN_..._meme.mp4: emoji, meme text, shake and sound effects at the big moments")
     ap.add_argument("--no-chat", action="store_true")
     ap.add_argument("--chat-lag", type=float, default=6, help="seconds chat reacts after a moment")
+    ap.add_argument("--edges", choices=["auto", "signals", "groq"], default="auto",
+                    help="who picks clip start/end: signals (build-up + reaction), or groq reading the transcript "
+                         "(free GROQ_API_KEY); auto = groq when the key is set")
     ap.add_argument("--ai", action="store_true", help="have Claude rate/title/trim every candidate")
     ap.add_argument("--ai-model", default="claude-opus-5-5")
     ap.add_argument("--ai-min", type=int, default=6, help="drop candidates Claude scores below this")
     ap.add_argument("--seg-time", type=int, default=30)
     ap.add_argument("--max-height", type=int, default=4320, help="cap source resolution (default: best available)")
+    ap.add_argument("--min-height", type=int, default=1080,
+                    help="refuse sources below this resolution instead of recording lower quality")
     ap.add_argument("--keep-minutes", type=float, default=20,
                     help="live mode: delete raw segments older than this (0 = keep everything)")
     ap.add_argument("--duration", type=float, default=0, help="live mode: stop after N minutes (0 = until stream ends)")
     args = ap.parse_args()
+    global MAX_CAM_UPSCALE, SHARPEN
+    MAX_CAM_UPSCALE, SHARPEN = args.cam_upscale, not args.no_sharpen
     import shutil
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
@@ -1495,7 +2295,10 @@ def main():
     heatmap = []
 
     if not is_file:
-        info, _ = resolve_stream(args.source, args.max_height)
+        try:
+            info, _ = resolve_stream(args.source, args.min_height, args.max_height)
+        except LowQualitySource as e:
+            sys.exit(f"source rejected: {e}")
         live = bool(info.get("is_live"))
         log(f"source: {info.get('title')} | {info.get('uploader') or info.get('channel')} | live={live}")
         if not live:
@@ -1505,18 +2308,21 @@ def main():
             import yt_dlp
             dst = run_dir / "source.%(ext)s"
             with yt_dlp.YoutubeDL({"quiet": True, "outtmpl": str(dst), "merge_output_format": "mp4",
-                                   "format": f"bestvideo[height<={args.max_height}]+bestaudio/best"}) as y:
+                                   "format": format_selector(args.min_height, args.max_height)}) as y:
                 y.download([args.source])
             args.source = str(next(run_dir.glob("source.*")))
             is_file = True
 
     if is_file:
+        h = probe_height(args.source)
+        if h and h < args.min_height:
+            sys.exit(f"source rejected: {args.source} is {h}p, below --min-height {args.min_height}")
         log("splitting file into segments...")
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", args.source, "-map", "0:v:0",
                         "-map", "0:a:0?", "-c", "copy", "-f", "segment", "-segment_time", str(args.seg_time),
                         str(segdir / "seg_%06d.ts")], check=True)
     else:
-        recorder = Recorder(args.source, segdir, args.seg_time, args.max_height)
+        recorder = Recorder(args.source, segdir, args.seg_time, args.min_height, args.max_height)
         recorder.start()
         if not args.no_chat:
             host = args.source.lower()
@@ -1549,6 +2355,15 @@ def main():
         except Exception as e:
             log(f"AI review disabled: {e}")
 
+    use_groq = False
+    if args.edges != "signals":
+        import groq_client
+        use_groq = bool(groq_client.api_key())
+        if use_groq:
+            log(f"edges: groq picks clip start/end from the transcript ({groq_client.TEXT_MODELS[0]})")
+        elif args.edges == "groq":
+            log("edges: --edges groq needs GROQ_API_KEY in .env (free: console.groq.com/keys); using signals")
+
     tl = Timeline(whisper, args.language, args.chat_lag)
     tl.heat = heatmap
     renderer = Renderer(outdir, args)
@@ -1566,7 +2381,7 @@ def main():
     frontier, last_end = 0, -1e9
     prev_clip = None
     started = time.time()
-    lookahead = 45  # seconds of future needed to see how a moment ends
+    lookahead = 60  # seconds of future needed to see how a moment ends (reactions can run ~30s)
     layout_tries = 0
 
     def shutdown(*_):
@@ -1591,7 +2406,7 @@ def main():
                 if lay and lay["mode"] != "blur":
                     if tl.layout is None:
                         log(f"layout: {lay['mode']} (facecam/face found -> emotion + reaction tracking on)")
-                    tl.layout = lay
+                    tl.layout = steadier_layout(lay, tl.layout)
             seg = tl.add_segment(int(p.stem.split("_")[1]), p, p.stat().st_mtime)
             done_idx.add(p.name)
             if seg:
@@ -1602,11 +2417,18 @@ def main():
         if feats is not None:
             avail = len(feats["E"]) - (0 if finished else lookahead)
             expected = args.target_per_hour * tl.end / 3600
-            perc = float(np.clip(args.percentile - 4 * (expected - made), 60, 97))
+            perc = float(np.clip(args.percentile - 4 * (expected - made), args.min_percentile, 98))
             cands, frontier = find_clips(tl, feats, frontier, max(avail, frontier), last_end, args, perc,
-                                         prev_clip)
+                                         prev_clip, ahead=made - expected)
             for c in cands:
                 c.end = min(c.end, tl.end)
+                if c.replaces is None and c.start < last_end + 0.5:   # an earlier clip in this batch grew into it
+                    c.start = last_end + 0.5
+                    if c.end - c.start < args.min_len * 0.75:
+                        continue
+                if use_groq and tl.words:
+                    lo = c.start if c.replaces is not None else max(0.0, last_end + 0.5)
+                    groq_edges(tl, feats, c, lo, args)
                 if ai_client:
                     try:
                         v = ai_review(ai_client, args.ai_model, tl, c, args)

@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HypeCut</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --ink: #1c1c1a; --muted: #6b6b66; --line: #e2e1dc;
+  --accent: #d9480f; --accent-ink: #fff; --ok: #2b8a3e; --bad: #c92a2a; --warn: #b7791f;
+  --code: #f0efea;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151514; --panel: #1f1f1d; --ink: #ecebe6; --muted: #9a9993; --line: #33322f;
+          --accent: #ff6b2c; --accent-ink: #151514; --ok: #51cf66; --bad: #ff6b6b; --warn: #f5b041;
+          --code: #11110f; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+       font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { padding: 14px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 12px; }
+header h1 { margin: 0; font-size: 20px; letter-spacing: -.01em; }
+header span { color: var(--muted); font-size: 13px; }
+main { display: grid; grid-template-columns: minmax(300px, 420px) 1fr; gap: 20px; padding: 20px; align-items: start; }
+@media (max-width: 860px) { main { grid-template-columns: 1fr; padding: 16px; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 20px; }
+h2 { font-size: 15px; margin: 0 0 12px; }
+textarea, input, select { width: 100%; font: inherit; color: inherit; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+textarea { min-height: 84px; resize: vertical; font-family: ui-monospace, monospace; font-size: 13px; }
+label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.checks { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 12px; }
+.checks label { display: flex; gap: 6px; align-items: center; margin: 0; color: var(--ink); font-size: 14px; }
+.checks input { width: auto; }
+button { font: inherit; font-size: 14px; border-radius: 6px; padding: 6px 12px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; padding: 8px 16px; }
+button.danger { color: var(--bad); }
+button.on { background: var(--ok); border-color: var(--ok); color: #fff; }
+button:disabled { opacity: .5; cursor: default; }
+.msg { font-size: 13px; margin-top: 8px; min-height: 1em; }
+.msg.err { color: var(--bad); }
+.job { border-top: 1px solid var(--line); padding: 12px 0; }
+.job:first-of-type { border-top: 0; padding-top: 0; }
+.job .top { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.job .url { font-size: 13px; word-break: break-all; color: var(--muted); margin: 4px 0; }
+.badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 99px; border: 1px solid currentColor; }
+.s-running { color: var(--ok); } .s-stopping { color: var(--warn); } .s-finished, .s-stopped { color: var(--muted); }
+.s-failed, .s-interrupted { color: var(--bad); }
+.job .acts { display: flex; gap: 6px; margin-left: auto; }
+pre.log { background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin: 8px 0 0;
+  font-size: 12px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.folders { display: flex; flex-wrap: wrap; gap: 6px; }
+.folders button.sel { border-color: var(--accent); color: var(--accent); }
+.gal-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.gal-head h2 { margin: 0; }
+.gal-head .muted { color: var(--muted); font-size: 13px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 16px; }
+.clip { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--bg); display: flex; flex-direction: column; }
+.clip.kept { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok); }
+.clip video { width: 100%; aspect-ratio: 9/16; background: #000; display: block; }
+.clip .body { padding: 10px; display: flex; flex-direction: column; gap: 6px; flex: 1; }
+.clip .name { font-size: 12px; font-family: ui-monospace, monospace; word-break: break-all; color: var(--muted); }
+.clip .score { font-weight: 600; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { font-size: 11px; padding: 1px 7px; border-radius: 99px; background: var(--code); border: 1px solid var(--line); }
+.clip .meta { font-size: 12px; color: var(--muted); }
+.clip .acts { display: flex; gap: 6px; margin-top: auto; padding-top: 4px; flex-wrap: wrap; }
+.tabs { display: flex; gap: 4px; }
+.tabs button { font-size: 12px; padding: 2px 8px; }
+.tabs button.sel { border-color: var(--accent); color: var(--accent); }
+.empty { color: var(--muted); font-size: 14px; }
+.stor { display: flex; gap: 8px; align-items: center; padding: 4px 0; border-top: 1px solid var(--line); font-size: 14px; }
+.stor:first-child { border-top: 0; }
+.stor .sz { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted); }
+.stor-foot { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+.srow { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.srow input { flex: 1; min-width: 0; font-family: ui-monospace, monospace; font-size: 13px; }
+.srow button { flex: none; }
+.srow .x { padding: 6px 10px; color: var(--muted); }
+.smsg { font-size: 12px; margin: -2px 0 8px 2px; color: var(--muted); min-height: 0; }
+.smsg.err { color: var(--bad); } .smsg.ok { color: var(--ok); }
+button.add { margin-top: 2px; font-size: 13px; }
+.ai { font-size: 13px; padding: 6px 8px; border-radius: 6px; border-left: 3px solid var(--muted); background: var(--panel); }
+.ai.keep { border-left-color: var(--ok); } .ai.reject { border-left-color: var(--bad); } .ai.err { color: var(--bad); }
+.ai b { margin-right: 4px; }
+.ai .t { color: var(--muted); font-style: italic; }
+button.suggest { box-shadow: 0 0 0 2px var(--accent); }
+.tools { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-left: auto; }
+.tools .muted { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header><h1>HypeCut</h1><span>paste a stream, get vertical clips</span></header>
+<main>
+  <div>
+    <section>
+      <h2>New clipping job</h2>
+      <form id="f" onsubmit="return false">
+        <label>Streams (each one starts on its own)</label>
+        <div id="streams"></div>
+        <button type="button" id="addstream" class="add">+ Add stream</button>
+        <label style="margin-top:14px">Options for the next stream you start</label>
+        <div class="row">
+          <div><label for="layout">Layout</label>
+            <select id="layout">
+              <option value="auto">auto</option><option value="float">float</option>
+              <option value="split">split</option><option value="track">track (IRL)</option>
+              <option value="blur">blur</option>
+            </select></div>
+          <div><label for="tph">Target clips / hour</label><input id="tph" type="number" min="1" step="any" placeholder="default (12)" title="leave empty for the default; 0 would make it stricter after every clip"></div>
+          <div><label for="dur">Stop after (minutes)</label><input id="dur" type="number" min="0" step="any" placeholder="until stream ends"></div>
+          <div><label for="minh">Min source height</label>
+            <select id="minh"><option value="">any</option><option>480</option><option>720</option><option>1080</option></select></div>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="memes"> meme versions</label>
+          <label><input type="checkbox" id="captions"> captions</label>
+          <label><input type="checkbox" id="aicam"> AI facecam upscale (slow)</label>
+          <label title="Gemini watches each new clip and suggests Keep or Reject"><input type="checkbox" id="autocls"> auto-classify clips (Gemini)</label>
+        </div>
+      </form>
+    </section>
+    <section>
+      <h2>Jobs <span class="meta" id="mem" style="font-weight:400"></span></h2>
+      <div id="jobs"><div class="empty">No jobs yet.</div></div>
+    </section>
+  </div>
+  <div>
+    <section>
+      <h2>Clip folders</h2>
+      <div class="folders" id="folders"></div>
+    </section>
+    <section>
+      <h2>Storage <span class="meta" style="font-weight:400">raw recordings and render files left in each folder's .work</span></h2>
+      <div id="storage"><div class="empty">checking…</div></div>
+    </section>
+    <section id="gallery">
+      <div class="empty">Pick a folder to review its clips.</div>
+    </section>
+  </div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let current = null;          // selected folder
+let lastClipSig = "";        // to avoid re-rendering (and resetting videos) when nothing changed
+// page state kept in localStorage so a reload doesn't reset it
+const store = {
+  get(k, d) {
+    let v = null;
+    try { v = localStorage.getItem("hypecut." + k); } catch { return d; }
+    if (v === null) return d;
+    try { return JSON.parse(v); } catch { return v; }   // older pages saved plain strings
+  },
+  set(k, v) { try { localStorage.setItem("hypecut." + k, JSON.stringify(v)); } catch {} },
+};
+const openLogs = new Set(store.get("openLogs", []));  // job ids with log expanded
+const view = store.get("view", {});                    // clip file -> "clip" | "meme"
+const saveLogs = () => store.set("openLogs", [...openLogs]);
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} :
+    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const j = await r.json().catch(() => ({error: r.statusText}));
+  if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
+  return j;
+}
+
+// ---- stream rows: one link per row, each started on its own
+let streams = store.get("streams", null) || [""];
+const rowMsg = {};   // row index -> {text, cls} shown under the row until the next refresh changes it
+let lastJobs = [];
+
+function options() {
+  return {
+    layout: $("#layout").value, target_per_hour: $("#tph").value, duration: $("#dur").value,
+    min_height: $("#minh").value, memes: $("#memes").checked, captions: $("#captions").checked,
+    ai_cam: $("#aicam").checked, auto_classify: $("#autocls").checked,
+  };
+}
+
+function renderStreams() {
+  $("#streams").innerHTML = streams.map((u, i) => `
+    <div class="srow" data-i="${i}">
+      <input type="url" value="${esc(u)}" placeholder="https://www.youtube.com/watch?v=...  or  https://www.twitch.tv/channel"
+             aria-label="Stream link ${i + 1}">
+      <button type="button" class="primary" data-act="start">Start</button>
+      <button type="button" class="x" data-act="remove" title="remove this row (doesn't stop a running job)">×</button>
+    </div>
+    <div class="smsg" data-i="${i}"></div>`).join("");
+  updateStreamRows();
+}
+
+function updateStreamRows() {
+  document.querySelectorAll("#streams .srow").forEach(row => {
+    const i = +row.dataset.i, url = streams[i].trim();
+    const job = url && lastJobs.find(j => j.running && j.url === url);
+    const btn = row.querySelector("[data-act=start]");
+    btn.disabled = !!job || !url;
+    btn.textContent = job ? "Running" : "Start";
+    const m = document.querySelector(`#streams .smsg[data-i="${i}"]`);
+    const mm = rowMsg[i];
+    if (job && !(mm && mm.cls === "err")) { m.className = "smsg ok"; m.textContent = `clipping into ${job.out} · ${job.progress || job.status}`; }
+    else if (mm) { m.className = "smsg " + (mm.cls || ""); m.textContent = mm.text; }
+    else { m.className = "smsg"; m.textContent = ""; }
+  });
+}
+
+$("#streams").addEventListener("input", e => {
+  const row = e.target.closest(".srow"); if (!row) return;
+  streams[+row.dataset.i] = e.target.value; delete rowMsg[+row.dataset.i];
+  store.set("streams", streams); updateStreamRows();
+});
+
+$("#streams").addEventListener("keydown", e => {
+  if (e.key === "Enter" && e.target.matches(".srow input")) {
+    e.preventDefault(); e.target.closest(".srow").querySelector("[data-act=start]").click();
+  }
+});
+
+$("#streams").addEventListener("click", async e => {
+  const b = e.target.closest("button"); if (!b) return;
+  const i = +b.closest(".srow").dataset.i;
+  if (b.dataset.act === "remove") {
+    streams.splice(i, 1); if (!streams.length) streams = [""];
+    Object.keys(rowMsg).forEach(k => delete rowMsg[k]);
+    store.set("streams", streams); return renderStreams();
+  }
+  const url = streams[i].trim();
+  if (!/^https?:\/\/\S+$/i.test(url)) { rowMsg[i] = {text: "paste an http(s) link to a stream", cls: "err"}; return updateStreamRows(); }
+  b.disabled = true; rowMsg[i] = {text: "starting… (looking up the channel)"}; updateStreamRows();
+  try {
+    let r;
+    try { r = await api("/api/jobs", {urls: url, options: options()}); }
+    catch (err) {
+      if (!(err.data && err.data.low_memory) || !confirm(err.message + "\n\nStart anyway?")) throw err;
+      r = await api("/api/jobs", {urls: url, options: {...options(), force: true}});
+    }
+    rowMsg[i] = {text: "started: " + r.started.map(j => j.out).join(", "), cls: "ok"};
+    r.started.forEach(j => openLogs.add(j.id)); saveLogs();
+    await refresh();
+  } catch (err) { rowMsg[i] = {text: err.message, cls: "err"}; updateStreamRows(); }
+});
+
+$("#addstream").addEventListener("click", () => {
+  streams.push(""); store.set("streams", streams); renderStreams();
+  const inputs = document.querySelectorAll("#streams .srow input"); inputs[inputs.length - 1].focus();
+});
+
+// ---- storage: leftover recordings / render files
+const fmtBytes = n => n >= 1e9 ? (n / 1073741824).toFixed(1) + " GB" : n >= 1e6 ? Math.round(n / 1048576) + " MB" : Math.round(n / 1024) + " KB";
+async function loadStorage() {
+  let d;
+  try { d = await api("/api/storage"); } catch { return; }
+  const free = d.folders.filter(f => !f.in_use).reduce((a, f) => a + f.bytes, 0) + d.tmp_bytes;
+  const box = $("#storage");
+  if (!d.folders.length && !d.tmp_bytes) { box.innerHTML = '<div class="empty">Nothing left over.</div>'; return; }
+  box.innerHTML = d.folders.map(f => `<div class="stor"><span>${esc(f.folder)}</span><span class="sz">${fmtBytes(f.bytes)}</span>
+      ${f.in_use ? '<span class="meta">in use</span>' : `<button data-clean="${esc(f.folder)}" data-bytes="${f.bytes}">Clean</button>`}</div>`).join("")
+    + (d.tmp_bytes ? `<div class="stor"><span>dashboard previews (temp)</span><span class="sz">${fmtBytes(d.tmp_bytes)}</span></div>` : "")
+    + `<div class="stor-foot">Clips, their .json and rejected/ are never touched. Folders a running job writes to are skipped.
+       <button class="danger" data-clean="__all__" data-bytes="${free}" ${free ? "" : "disabled"}>Clean all (${fmtBytes(free)})</button></div>`;
+}
+$("#storage").addEventListener("click", async e => {
+  const b = e.target.closest("button[data-clean]"); if (!b) return;
+  const all = b.dataset.clean === "__all__";
+  const what = all ? "all folders not in use" : b.dataset.clean;
+  if (!confirm(`Delete ${fmtBytes(+b.dataset.bytes)} of leftover recordings and render files in ${what}?\n\nYour clips stay. This can't be undone.`)) return;
+  b.disabled = true;
+  try {
+    const r = await api("/api/storage/clean", all ? {all: true} : {folders: [b.dataset.clean]});
+    if (r.skipped_in_use.length) alert("Skipped (a job is writing there): " + r.skipped_in_use.join(", "));
+  } catch (err) { alert(err.message); }
+  loadStorage();
+});
+
+function ago(t) { const s = Math.round(Date.now()/1000 - t); return s < 60 ? s+"s" : s < 3600 ? Math.round(s/60)+"m" : (s/3600).toFixed(1)+"h"; }
+
+async function renderJobs(jobs) {
+  const box = $("#jobs");
+  if (!jobs.length) { box.innerHTML = '<div class="empty">No jobs yet.</div>'; return; }
+  const logs = {};
+  await Promise.all(jobs.filter(j => openLogs.has(j.id)).map(async j => {
+    try { logs[j.id] = (await api(`/api/jobs/${j.id}?n=80`)).log; } catch {}
+  }));
+  // keep log scroll position if the user scrolled up
+  const scroll = {};
+  box.querySelectorAll("pre.log").forEach(p => scroll[p.dataset.id] = p.scrollHeight - p.scrollTop - p.clientHeight < 20 ? -1 : p.scrollTop);
+  box.innerHTML = jobs.map(j => {
+    const st = j.status.split(" ")[0];
+    const acts = j.running
+      ? (j.status === "stopping" ? `<button class="danger" data-act="kill" data-id="${j.id}">Kill now</button>`
+                                 : `<button class="danger" data-act="stop" data-id="${j.id}">Stop</button>`)
+      : `<button data-act="forget" data-id="${j.id}">Remove</button>`;
+    return `<div class="job">
+      <div class="top"><span class="badge s-${st}">${esc(j.status)}</span>
+        <b>${esc(j.out)}</b><span class="meta">${j.progress ? esc(j.progress) + " · " : ""}${j.clips} clip${j.clips === 1 ? "" : "s"}${j.rendering ? ` · ${j.rendering} rendering` : ""} · started ${ago(j.started)} ago</span>
+        <div class="acts"><button data-act="view" data-out="${esc(j.out)}">Clips</button>
+          <button data-act="log" data-id="${j.id}">${openLogs.has(j.id) ? "Hide log" : "Log"}</button>${acts}</div></div>
+      <div class="url">${esc(j.url)}</div>
+      ${openLogs.has(j.id) ? `<pre class="log" data-id="${j.id}">${esc((logs[j.id] || []).join("\n")) || "(no output yet)"}</pre>` : ""}
+    </div>`;
+  }).join("");
+  box.querySelectorAll("pre.log").forEach(p => {
+    const s = scroll[p.dataset.id]; p.scrollTop = (s === undefined || s === -1) ? p.scrollHeight : s;
+  });
+}
+
+$("#jobs").addEventListener("click", async e => {
+  const b = e.target.closest("button"); if (!b) return;
+  const id = b.dataset.id, act = b.dataset.act;
+  if (act === "view") return selectFolder(b.dataset.out);
+  if (act === "log") { openLogs.has(id) ? openLogs.delete(id) : openLogs.add(id); saveLogs(); return refresh(); }
+  if (act === "kill" && !confirm("Kill the job now? Clips still rendering are lost.")) return;
+  b.disabled = true;
+  try { await api(`/api/jobs/${id}/${act}`, {}); } catch (err) { alert(err.message); }
+  refresh();
+});
+
+function renderFolders(folders) {
+  $("#folders").innerHTML = folders.length ? folders.map(f =>
+    `<button data-f="${esc(f.name)}" class="${f.name === current ? "sel" : ""}">${esc(f.name)} (${f.clips})</button>`).join("")
+    : '<div class="empty">No clip folders yet.</div>';
+}
+$("#folders").addEventListener("click", e => { const b = e.target.closest("button"); if (b) selectFolder(b.dataset.f); });
+
+function selectFolder(name) {
+  current = name;
+  store.set("folder", name);
+  refresh(true);
+}
+
+const sug = c => c.ai && !c.ai.error ? (c.ai.keep ? "keep" : "reject") : null;
+
+function aiLine(c, d) {
+  const a = c.ai, cl = d.classify;
+  if (cl.current === c.file) return '<div class="ai">AI is checking this clip…</div>';
+  if (!a) return "";
+  if (a.error) return `<div class="ai err">AI check failed: ${esc(a.error)}</div>`;
+  return `<div class="ai ${a.keep ? "keep" : "reject"}"><b>AI: ${a.keep ? "keep" : "reject"} ${esc(a.score)}/10</b>${esc(a.reason)}
+    ${a.title ? `<div class="t">“${esc(a.title)}”</div>` : ""}
+    ${a.model ? `<div class="t" title="lite models are weaker judges">by ${esc(a.model.replace(/^gemini-/, ""))}</div>` : ""}</div>`;
+}
+
+function clipCard(folder, c, d) {
+  const mode = view[c.file] === "meme" && c.meme ? "meme" : "clip";
+  const src = `/media/${encodeURIComponent(folder)}/${encodeURIComponent(mode === "meme" ? c.meme : c.file)}`;
+  const score = c.score != null ? Number(c.score).toFixed(2) : "?";
+  return `<div class="clip ${c.kept ? "kept" : ""}" data-file="${esc(c.file)}">
+    <video controls preload="metadata" playsinline src="${src}"></video>
+    <div class="body">
+      ${c.meme ? `<div class="tabs"><button data-act="mode" data-m="clip" class="${mode === "clip" ? "sel" : ""}">clip</button>
+                 <button data-act="mode" data-m="meme" class="${mode === "meme" ? "sel" : ""}">meme</button></div>` : ""}
+      ${c.title ? `<b>${esc(c.title)}</b>` : ""}
+      <div><span class="score">score ${score}</span>${c.ai_score != null ? ` · AI ${esc(c.ai_score)}` : ""}
+        ${c.emotion ? ` · ${esc(c.emotion)}` : ""}${c.duration ? ` · ${Number(c.duration).toFixed(0)}s` : ""}</div>
+      ${aiLine(c, d)}
+      <div class="chips">${(c.reasons || []).map(r => `<span class="chip">${esc(r)}</span>`).join("")}</div>
+      ${c.edges && c.edges !== "signals" ? `<div class="meta">edges: ${esc(c.edges)}</div>` : ""}
+      ${c.captions ? `<div class="meta">captions: ${esc(c.captions)}</div>` : ""}
+      <div class="name">${esc(c.file)}</div>
+      <div class="acts">
+        <button data-act="${c.kept ? "unkeep" : "keep"}" class="${c.kept ? "on" : sug(c) === "keep" ? "suggest" : ""}">${c.kept ? "Kept ✓" : "Keep"}</button>
+        <button data-act="reject" class="danger ${!c.kept && sug(c) === "reject" ? "suggest" : ""}">Reject</button>
+      </div>
+    </div></div>`;
+}
+
+function tools(d) {
+  const cl = d.classify, pending = cl.queued + (cl.current ? 1 : 0);
+  const todo = d.clips.filter(c => !c.ai || c.ai.error).length;
+  const toApply = d.clips.filter(c => !c.kept && sug(c)).length;
+  if (!d.gemini) return '<span class="muted">add GEMINI_API_KEY or GROQ_API_KEY to .env to auto-classify</span>';
+  return `${pending ? `<span class="muted">classifying, ${pending} left…</span>` : ""}
+    <button data-tool="classify" ${!todo || pending ? "disabled" : ""}>Classify ${todo ? todo + " " : ""}with AI</button>
+    <button data-tool="auto" class="${cl.auto ? "on" : ""}" title="classify new clips as they finish">Auto ${cl.auto ? "on" : "off"}</button>
+    <button data-tool="apply" class="primary" ${toApply ? "" : "disabled"}>Apply ${toApply || ""} suggestion${toApply === 1 ? "" : "s"}</button>`;
+}
+
+async function renderGallery(force = false) {
+  const g = $("#gallery");
+  if (!current) return;
+  let d;
+  try { d = await api(`/api/clips?folder=${encodeURIComponent(current)}`); }
+  catch (err) { g.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  const sig = JSON.stringify(d) + JSON.stringify(view);
+  if (!force && sig === lastClipSig) return;
+  // background refreshes wait while a video plays, so new clips don't interrupt review
+  if (!force && lastClipSig && [...g.querySelectorAll("video")].some(v => !v.paused)) return;
+  lastClipSig = sig;
+  const kept = d.clips.filter(c => c.kept).length;
+  g.innerHTML = `<div class="gal-head"><h2>${esc(d.folder)}</h2>
+      <span class="muted">${d.clips.length} clips · ${kept} kept · ${d.rejected} in rejected/${d.rendering ? ` · ${d.rendering} rendering…` : ""}</span>
+      <div class="tools">${tools(d)}</div></div>
+    ${d.clips.length ? `<div class="grid">${d.clips.map(c => clipCard(d.folder, c, d)).join("")}</div>`
+                     : '<div class="empty">No clips here yet. They appear as soon as they finish rendering.</div>'}`;
+}
+
+$("#gallery").addEventListener("click", async e => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.tool) {
+    const t = b.dataset.tool;
+    if (t === "apply") {
+      const g = $("#gallery");
+      const keep = g.querySelectorAll('.clip button[data-act=keep].suggest').length;
+      const rej = g.querySelectorAll('.clip button[data-act=reject].suggest').length;
+      if (!confirm(`Mark ${keep} clip(s) Keep and move ${rej} clip(s) to rejected/?\nClips you already marked Kept are left alone.`)) return;
+    }
+    b.disabled = true;
+    try {
+      if (t === "classify") await api("/api/classify", {folder: current});
+      if (t === "auto") await api("/api/classify/auto", {folder: current, on: !b.classList.contains("on")});
+      if (t === "apply") await api("/api/clips/apply", {folder: current});
+    } catch (err) { alert(err.message); }
+    return renderGallery(true);
+  }
+  const card = b.closest(".clip"); const file = card.dataset.file; const act = b.dataset.act;
+  if (act === "mode") { view[file] = b.dataset.m; store.set("view", view); return renderGallery(true); }
+  b.disabled = true;
+  try {
+    await api(`/api/clips/${act}`, {folder: current, file});
+    await renderGallery(true);
+  } catch (err) { alert(err.message); b.disabled = false; }
+});
+
+async function refresh(force = false) {
+  try {
+    const s = await api("/api/state");
+    lastJobs = s.jobs; updateStreamRows();
+    await renderJobs(s.jobs);
+    if (s.mem_free_gb != null) {
+      const fits = Math.max(0, Math.floor((s.mem_free_gb - s.render_mem_gb) / s.job_mem_gb));
+      $("#mem").textContent = `· ${s.mem_free_gb} GB memory free (room for about ${fits} more job${fits === 1 ? "" : "s"})`;
+      $("#mem").style.color = fits < 1 ? "var(--bad)" : "";
+    }
+    renderFolders(s.folders);
+    await renderGallery(force === true);
+  } catch (err) { console.error(err); }
+}
+current = store.get("folder", null);
+// form: remember the options (and an unsent URL list) across reloads
+const formIds = ["layout", "tph", "dur", "minh", "memes", "captions", "aicam", "autocls"];
+const formState = store.get("form", {});
+if (formState.urls && !store.get("streams", null)) {   // older page kept a textarea of links
+  streams = formState.urls.split(/[\s,]+/).filter(Boolean); if (!streams.length) streams = [""];
+  store.set("streams", streams);
+}
+renderStreams();
+formIds.forEach(id => {
+  const el = document.getElementById(id); if (!el) return;
+  if (id in formState) el.type === "checkbox" ? (el.checked = formState[id]) : (el.value = formState[id]);
+  el.addEventListener("input", saveForm); el.addEventListener("change", saveForm);
+});
+function saveForm() {
+  const f = {};
+  formIds.forEach(id => { const el = document.getElementById(id); if (el) f[id] = el.type === "checkbox" ? el.checked : el.value; });
+  store.set("form", f);
+}
+refresh();
+setInterval(refresh, 2500);
+loadStorage();
+setInterval(loadStorage, 20000);
+</script>
+</body>
+</html>

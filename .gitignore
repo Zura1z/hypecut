@@ -12,3 +12,5 @@ samples/
 *.mp4
 *.ts
 *.mkv
+# downloaded helper binaries
+tools/

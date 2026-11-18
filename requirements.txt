@@ -5,3 +5,4 @@ faster-whisper>=1.1
 google-genai>=1.0
 anthropic>=0.50
 pydantic>=2.6
+pillow>=10  # emoji for --memes
