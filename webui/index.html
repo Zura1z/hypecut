@@ -118,7 +118,6 @@ button.suggest { box-shadow: 0 0 0 2px var(--accent); }
             <select id="minh"><option value="">any</option><option>480</option><option>720</option><option>1080</option></select></div>
         </div>
         <div class="checks">
-          <label><input type="checkbox" id="memes"> meme versions</label>
           <label><input type="checkbox" id="captions"> captions</label>
           <label><input type="checkbox" id="aicam"> AI facecam upscale (slow)</label>
           <label title="Gemini watches each new clip and suggests Keep or Reject"><input type="checkbox" id="autocls"> auto-classify clips (Gemini)</label>
@@ -179,7 +178,7 @@ let lastJobs = [];
 function options() {
   return {
     layout: $("#layout").value, target_per_hour: $("#tph").value, duration: $("#dur").value,
-    min_height: $("#minh").value, memes: $("#memes").checked, captions: $("#captions").checked,
+    min_height: $("#minh").value, captions: $("#captions").checked,
     ai_cam: $("#aicam").checked, auto_classify: $("#autocls").checked,
   };
 }
@@ -461,7 +460,7 @@ async function refresh(force = false) {
 }
 current = store.get("folder", null);
 // form: remember the options (and an unsent URL list) across reloads
-const formIds = ["layout", "tph", "dur", "minh", "memes", "captions", "aicam", "autocls"];
+const formIds = ["layout", "tph", "dur", "minh", "captions", "aicam", "autocls"];
 const formState = store.get("form", {});
 if (formState.urls && !store.get("streams", null)) {   // older page kept a textarea of links
   streams = formState.urls.split(/[\s,]+/).filter(Boolean); if (!streams.length) streams = [""];

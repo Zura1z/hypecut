@@ -109,12 +109,33 @@ def clip_files(folder):
                   key=lambda f: f.name)
 
 
+_playable = {}   # (path, size, mtime) -> ffprobe found a video stream
+
+
+def playable(f):
+    st = f.stat()
+    key = (str(f), st.st_size, st.st_mtime)
+    if key not in _playable:
+        ok = False
+        if st.st_size > 0:
+            try:
+                r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                    "stream=codec_name", "-of", "csv=p=0", str(f)], capture_output=True, text=True,
+                                   timeout=20)
+                ok = r.returncode == 0 and bool(r.stdout.strip())
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+        _playable[key] = ok
+    return _playable[key]
+
+
 def finished_clips(folder):
     """Clips that are done: clipper writes NNN_x.json last, after the clip and its meme version.
-    A clip without one counts as done once it hasn't changed for 2 minutes (stray/hand-made videos)."""
+    A clip without one (hand-made video, or a render cut off by a crash) only counts if it hasn't changed for
+    2 minutes AND is a readable video, so broken 0-byte leftovers don't show as clips."""
     now = time.time()
     return [f for f in clip_files(folder)
-            if f.with_suffix(".json").is_file() or now - f.stat().st_mtime > 120]
+            if f.with_suffix(".json").is_file() or (now - f.stat().st_mtime > 120 and playable(f))]
 
 
 def output_folders():
@@ -411,7 +432,7 @@ def set_auto(folder_name, on):
 
 def build_argv(url, out, opt):
     argv = [str(PYTHON if PYTHON.exists() else sys.executable), str(CLIPPER), url, "--out", out]
-    for flag in ("memes", "captions", "ai_cam"):
+    for flag in ("captions", "ai_cam"):   # no meme versions from the dashboard (dropped: they looked bad)
         if opt.get(flag):
             argv.append("--" + flag.replace("_", "-"))
     layout = opt.get("layout") or "auto"
@@ -1049,7 +1070,7 @@ class Handler(BaseHTTPRequestHandler):
             size = os.fstat(f.fileno()).st_size
             ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             start, end = 0, size - 1
-            rng = self.headers.get("Range")
+            rng = self.headers.get("Range") if size else None   # empty file: plain 200, no 416
             m = re.fullmatch(r"bytes=(\d*)-(\d*)", rng.strip()) if rng else None
             if m and (m.group(1) or m.group(2)):
                 if m.group(1):
