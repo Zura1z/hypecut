@@ -1199,6 +1199,11 @@ def letterbox_rows(frames):
     return (y0, y1)
 
 
+STACK_CAM_SHARE = 0.28        # --layout stack: facecam strip height as a share of the 1920 px frame
+STACK_BAR_H = 10              # divider between gameplay and facecam
+STACK_BAR_COLOR = "0xFFD400"  # same yellow as the progress bar
+
+
 def build_filter(layout, ass_name, src="[0:v]", zoom=None, dur=None, progress=False, cam_src=None, cam_k=4):
     W, H = layout["W"], layout["H"]
     mode = layout["mode"]
@@ -1233,12 +1238,19 @@ def build_filter(layout, ass_name, src="[0:v]", zoom=None, dur=None, progress=Fa
               f"{camf},pad=iw+16:ih+16:8:8:white[camv];"
               f"[bgv][camv]overlay=W-w-36:140,setsar=1,fps={OUT_FPS},format=yuv420p")
         cap_y = int(OUT_H * 0.72)
-    elif mode == "split":
+    elif mode in ("split", "stack"):
         cx, cy, cw, ch = layout["cam"]
         fx, fy, fw, fh = layout["face"]
-        cam_aspect = cw / max(ch, 1)
-        bot_h = even(min(1000, max(640, OUT_W / max(cam_aspect, 0.5))))
-        top_h = OUT_H - bot_h
+        if mode == "stack":
+            # gameplay gets ~72% on top, a thin accent bar, then the facecam as a full-width strip (head, shoulders
+            # and a bit of room, like most gaming Shorts) instead of a half-screen close-up of the face
+            bar = STACK_BAR_H
+            bot_h = even(OUT_H * STACK_CAM_SHARE)
+        else:
+            bar = 0
+            cam_aspect = cw / max(ch, 1)
+            bot_h = even(min(1000, max(640, OUT_W / max(cam_aspect, 0.5))))
+        top_h = OUT_H - bot_h - bar
         # facecam crop with the bottom panel's aspect, centred on the face, inside the cam box
         asp = OUT_W / bot_h
         w = min(cw, ch * asp)
@@ -1247,7 +1259,8 @@ def build_filter(layout, ass_name, src="[0:v]", zoom=None, dur=None, progress=Fa
         y = min(max(fy + fh * 0.6 - h / 2, cy), cy + ch - h)
         # gameplay crop for the top panel, steering clear of the facecam when possible
         gasp = OUT_W / top_h
-        gh = H
+        ay0, ay1 = layout.get("active", (0, H)) if mode == "stack" else (0, H)   # inside cutscene bars
+        gh = ay1 - ay0
         gw = min(W, gh * gasp)
         if gw >= W:
             gw, gh = W, W / gasp
@@ -1256,9 +1269,10 @@ def build_filter(layout, ass_name, src="[0:v]", zoom=None, dur=None, progress=Fa
             gx = cx - gw
         elif cx + cw / 2 <= W / 2 and gx < cx + cw and cx + cw + gw <= W * 0.92:
             gx = cx + cw
-        gy = (H - gh) / 2
+        gy = ay0 + (ay1 - ay0 - gh) / 2
         game = (f"[g]crop={even(gw)}:{even(gh)}:{even(gx)}:{even(gy)},scale={OUT_W}:{top_h}:flags=lanczos"
-                f"{',cas=0.35' if SHARPEN else ''}[top];")
+                f"{',cas=0.35' if SHARPEN else ''}"
+                f"{f',pad={OUT_W}:{top_h + bar}:0:0:color={STACK_BAR_COLOR}' if bar else ''}[top];")
         cap = MAX_CAM_UPSCALE
         if cam_src:
             # AI-upscaled cam frames (the cam box at cam_k x): real detail, so fill the full width again
@@ -1978,7 +1992,7 @@ class Renderer:
             return [], ""
         if getattr(self, "_meme_assets", None) is None:
             self._meme_assets = meme_assets((self.outdir / ".work" / "meme_assets").resolve())
-        text_y = (int(cap_y * 0.42) if layout["mode"] == "split" else 1060 if layout["mode"] == "float"
+        text_y = (int(cap_y * 0.42) if layout["mode"] in ("split", "stack") else 1060 if layout["mode"] == "float"
                   else int(OUT_H * 0.3))
         write_meme_ass(work / "memes.ass", events, text_y, self.args.font, seed=int(clip.start))
         base_fc, _ = build_filter(layout, None, src="[cv]", zoom=zoom, dur=out_dur, progress=not self.args.no_progress,
@@ -2027,7 +2041,7 @@ class Renderer:
             layout = detect_layout(frames)
             known = self.last_layout or tl.layout
             layout = steadier_layout(layout, known) if layout and layout["mode"] == "split" else layout
-            want = "split" if self.args.layout == "float" else self.args.layout   # float renders a split layout
+            want = "split" if self.args.layout in ("float", "stack") else self.args.layout   # rendered from a split detection
             if layout and want in ("split", "track") and layout["mode"] != want:
                 layout = known if known and known["mode"] == want else layout
             if (layout is None or layout["mode"] == "blur") and known and known["mode"] == "split":
@@ -2039,10 +2053,14 @@ class Renderer:
             layout = {"mode": "blur", "W": int(wh[0]) if wh[0] else 1920, "H": int(wh[1]) if len(wh) > 1 else 1080}
         if layout["mode"] != "blur":
             self.last_layout = layout
-        # what the viewer sees: facecam streams default to full-screen gameplay + floating cam
-        rlay = ({**layout, "mode": "float"} if layout["mode"] == "split" and self.args.layout in ("auto", "float")
-                else layout)
-        if rlay["mode"] == "float":   # cutscene bars come and go, so measure them for this clip only
+        # what the viewer sees: facecam streams default to gameplay on top + a facecam strip under it ("stack");
+        # "float" = full-screen gameplay with a small floating cam; "split" = the older half/half panels
+        rlay = layout
+        if layout["mode"] == "split" and self.args.layout in ("auto", "stack"):
+            rlay = {**layout, "mode": "stack"}
+        elif layout["mode"] == "split" and self.args.layout == "float":
+            rlay = {**layout, "mode": "float"}
+        if rlay["mode"] in ("float", "stack"):   # cutscene bars come and go, so measure them for this clip only
             rlay["active"] = letterbox_rows(frames) or (0, rlay["H"])
 
         has_audio = bool(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
@@ -2232,9 +2250,10 @@ def main():
                     help="the rate controller never lowers the bar below this percentile")
     ap.add_argument("--warmup", type=float, default=180,
                     help="seconds of stream to watch before the first clip (learns the streamer's normal)")
-    ap.add_argument("--layout", choices=["auto", "float", "split", "track", "blur"], default="auto",
-                    help="auto: facecam streams -> float (full-screen gameplay + floating cam); split = gameplay top, "
-                         "cam bottom; track = follow the face (IRL); blur = 4:3 on blurred background")
+    ap.add_argument("--layout", choices=["auto", "stack", "float", "split", "track", "blur"], default="auto",
+                    help="auto: facecam streams -> stack (gameplay on top, facecam strip under it); float = full-screen "
+                         "gameplay + floating cam; split = gameplay top half, cam close-up bottom; track = follow the "
+                         "face (IRL); blur = 4:3 on blurred background")
     ap.add_argument("--whisper", default="base", help="faster-whisper model (tiny/base/small/medium) or 'none'")
     ap.add_argument("--language", default=None, help="force transcript language, e.g. en, hi, ur")
     ap.add_argument("--captions", action="store_true",

@@ -106,8 +106,10 @@ button.suggest { box-shadow: 0 0 0 2px var(--accent); }
         <div class="row">
           <div><label for="layout">Layout</label>
             <select id="layout">
-              <option value="auto">auto</option><option value="float">float</option>
-              <option value="split">split</option><option value="track">track (IRL)</option>
+              <option value="auto">auto (stack for facecam streams)</option>
+              <option value="stack">stack: gameplay, cam strip under</option>
+              <option value="float">float: floating cam</option>
+              <option value="split">split: half/half</option><option value="track">track (IRL)</option>
               <option value="blur">blur</option>
             </select></div>
           <div><label for="tph">Target clips / hour</label><input id="tph" type="number" min="1" step="any" placeholder="default (12)" title="leave empty for the default; 0 would make it stricter after every clip"></div>

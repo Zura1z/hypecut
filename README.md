@@ -90,7 +90,7 @@ Clip length follows the moment: a clip starts where the build-up began (plus `--
 ## Layouts (detected automatically)
 | Stream type | Output |
 |---|---|
-| Gameplay + facecam overlay | gameplay on top, **face at bottom** |
+| Gameplay + facecam overlay | `stack`: gameplay on the top ~72% (cropped inside cutscene black bars), a thin yellow divider, and the facecam as a full-width strip underneath (head, shoulders, a bit of the room). A small facecam is enlarged at most `--cam-upscale` (2.4x) and shown over a blurred copy of itself, so it stays sharp |
 | Full-cam / IRL / just chatting | 9:16 crop that follows the face |
 | No face | 4:3 center on a blurred background |
 
@@ -107,7 +107,7 @@ Clip length follows the moment: a clip starts where the build-up began (plus `--
 | `--min-gap` | 12 | seconds between separate clips (closer moments get merged) |
 | `--captions` | off | Gemini-verified Hinglish captions; skipped when in doubt |
 | `--ai` | off | Claude review (needs `ANTHROPIC_API_KEY`) |
-| `--layout` | auto | force `split`, `track` or `blur` |
+| `--layout` | auto | `stack` (facecam streams' default), `float` (full-screen gameplay + small floating cam), `split` (half/half with a face close-up), `track` or `blur` |
 | `--keep-minutes` | 20 | deletes raw recording older than this (about 3 GB/hour at 1080p60) |
 | `--duration` | 0 | stop after N minutes |
 

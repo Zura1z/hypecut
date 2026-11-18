@@ -36,7 +36,7 @@ KEPT_NAME = "webui_kept.json"  # names of clips marked Keep
 AI_NAME = "webui_ai.json"      # Gemini's keep/reject suggestion per clip
 CLIP_RE = re.compile(r"^\d{3}_.*\.mp4$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-LAYOUTS = ("auto", "float", "split", "track", "blur")
+LAYOUTS = ("auto", "stack", "float", "split", "track", "blur")
 
 jobs = {}  # id -> Job
 jobs_lock = threading.Lock()
