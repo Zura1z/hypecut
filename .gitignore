@@ -1,0 +1,14 @@
+# secrets
+.env
+# local environment
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+# output and recordings
+clips*/
+test/
+samples/
+*.mp4
+*.ts
+*.mkv
