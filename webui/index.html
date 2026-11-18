@@ -198,12 +198,23 @@ function updateStreamRows() {
   document.querySelectorAll("#streams .srow").forEach(row => {
     const i = +row.dataset.i, url = streams[i].trim();
     const job = url && lastJobs.find(j => j.running && j.url === url);
-    const btn = row.querySelector("[data-act=start]");
-    btn.disabled = !!job || !url;
-    btn.textContent = job ? "Running" : "Start";
+    const btn = row.querySelector("[data-act=start], [data-act=stop]");
+    const stopping = job && job.status === "stopping";
+    btn.dataset.act = job ? "stop" : "start";
+    btn.dataset.job = job ? job.id : "";
+    btn.className = job ? "danger" : "primary";
+    btn.disabled = stopping || (!job && !url);
+    btn.textContent = stopping ? "Stopping…" : job ? "Stop" : "Start";
+    btn.title = stopping ? "finishing the clips it already found, then you can Start again"
+              : job ? "stop this stream (clips being rendered still finish); then change options and Start again" : "";
     const m = document.querySelector(`#streams .smsg[data-i="${i}"]`);
     const mm = rowMsg[i];
-    if (job && !(mm && mm.cls === "err")) { m.className = "smsg ok"; m.textContent = `clipping into ${job.out} · ${job.progress || job.status}`; }
+    if (job && !(mm && mm.cls === "err")) {
+      m.className = "smsg ok";
+      m.textContent = stopping ? `stopping ${job.out}: finishing its renders… then Start again with new options`
+                               : `clipping into ${job.out} · ${job.progress || job.status}`;
+    }
+    else if (mm && mm.stopping) { m.className = "smsg"; m.textContent = "stopped. Change the options if you like, then press Start."; }
     else if (mm) { m.className = "smsg " + (mm.cls || ""); m.textContent = mm.text; }
     else { m.className = "smsg"; m.textContent = ""; }
   });
@@ -217,7 +228,7 @@ $("#streams").addEventListener("input", e => {
 
 $("#streams").addEventListener("keydown", e => {
   if (e.key === "Enter" && e.target.matches(".srow input")) {
-    e.preventDefault(); e.target.closest(".srow").querySelector("[data-act=start]").click();
+    e.preventDefault(); const b = e.target.closest(".srow").querySelector("[data-act=start]"); if (b) b.click();
   }
 });
 
@@ -228,6 +239,12 @@ $("#streams").addEventListener("click", async e => {
     streams.splice(i, 1); if (!streams.length) streams = [""];
     Object.keys(rowMsg).forEach(k => delete rowMsg[k]);
     store.set("streams", streams); return renderStreams();
+  }
+  if (b.dataset.act === "stop") {
+    b.disabled = true;
+    try { await api(`/api/jobs/${b.dataset.job}/stop`, {}); rowMsg[i] = {text: "stopping…", stopping: true}; }
+    catch (err) { rowMsg[i] = {text: err.message, cls: "err"}; }
+    return refresh();
   }
   const url = streams[i].trim();
   if (!/^https?:\/\/\S+$/i.test(url)) { rowMsg[i] = {text: "paste an http(s) link to a stream", cls: "err"}; return updateStreamRows(); }
