@@ -355,6 +355,13 @@ class Job:
                 return "done"
             if "finishing queued renders" in ln:
                 return "finishing renders"
+            m = re.search(r"scan: moment (\d+)/(\d+) at ([\d:]+)", ln)
+            if m:
+                return f"scan: moment {m.group(1)} of {m.group(2)} (at {m.group(3)} in the video)"
+            if "scan: measuring the audio" in ln:
+                return "scan: measuring the audio"
+            if "scan mode: downloading the audio" in ln:
+                return "scan: downloading the audio only"
             m = re.search(r"analyzed seg_\d+\.ts\s+t=\s*([\d.]+)s", ln)
             if m:
                 t = float(m.group(1)) + 30
@@ -435,6 +442,13 @@ def build_argv(url, out, opt):
     for flag in ("captions", "ai_cam"):   # no meme versions from the dashboard (dropped: they looked bad)
         if opt.get(flag):
             argv.append("--" + flag.replace("_", "-"))
+    watch = str(opt.get("watch") or "480")
+    if watch == "full":
+        argv += ["--live-lowres", "off"]
+    elif watch in ("360", "480", "720"):
+        argv += ["--watch-height", watch]
+    else:
+        raise ValueError(f"bad live watch quality {watch!r}")
     layout = opt.get("layout") or "auto"
     if layout not in LAYOUTS:
         raise ValueError(f"bad layout {layout!r}")
@@ -442,7 +456,8 @@ def build_argv(url, out, opt):
         argv += ["--layout", layout]
     for key, flag, kind, lo, hi in (("target_per_hour", "--target-per-hour", float, 1, 1000),
                                     ("duration", "--duration", float, 0, 7 * 24 * 60),
-                                    ("min_height", "--min-height", int, 0, 4320)):
+                                    ("min_height", "--min-height", int, 0, 4320),
+                                    ("max_height", "--max-height", int, 144, 4320)):
         v = opt.get(key)
         if v in (None, ""):
             continue
@@ -452,7 +467,7 @@ def build_argv(url, out, opt):
             raise ValueError(f"{key} must be a number")
         if not lo <= v <= hi:
             label = {"target_per_hour": "Target clips / hour", "duration": "Stop after (minutes)",
-                     "min_height": "Min source height"}[key]
+                     "min_height": "Min source height", "max_height": "Max resolution"}[key]
             raise ValueError(f"{label} must be between {lo} and {hi} (leave it empty for the default)")
         argv += [flag, str(v)]
     return argv
@@ -580,6 +595,120 @@ def keep_clip(folder, name, keep=True):
         save_kept(folder, kept)
 
 
+# ---------------------------------------------------------------- bandwidth counter
+# Every few seconds: the kernel's per-connection byte counters (ss -tinp) for HypeCut's own processes (this
+# dashboard + every clipper.py and their yt-dlp / ffmpeg children). Deltas are added to a per-day total saved
+# outside the repo. Loopback traffic (the browser talking to this page) is ignored.
+
+BW_FILE = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "hypecut" / "bandwidth.json"
+bw_lock = threading.Lock()
+bw_days = {}   # "YYYY-MM-DD" -> {"down": bytes, "up": bytes}
+_SS_SOCK = re.compile(r"^\S+\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s+users:\(\((.*)\)\)")
+_SS_PID = re.compile(r"pid=(\d+)")
+
+
+def hypecut_pids():
+    """This process, every clipper.py, and all their descendants."""
+    parent, roots = {}, {os.getpid()}
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            stat = (d / "stat").read_text()
+            parent[int(d.name)] = int(stat[stat.rindex(")") + 2:].split()[1])
+            if b"clipper.py" in (d / "cmdline").read_bytes():
+                roots.add(int(d.name))
+        except (OSError, ValueError):
+            continue
+    out, frontier = set(roots), list(roots)
+    kids = {}
+    for pid, pp in parent.items():
+        kids.setdefault(pp, []).append(pid)
+    while frontier:
+        for k in kids.get(frontier.pop(), []):
+            if k not in out:
+                out.add(k)
+                frontier.append(k)
+    return out
+
+
+def _is_local(addr):
+    host = addr.rsplit(":", 1)[0].strip("[]")
+    return host.startswith(("127.", "::1", "::ffff:127.")) or host in ("localhost", "*", "0.0.0.0")
+
+
+def bandwidth_watcher(interval=5):
+    last, first = {}, True
+    saved_at = time.time()
+    while True:
+        try:
+            pids = hypecut_pids()
+            out = subprocess.run(["ss", "-tinpH"], capture_output=True, text=True, timeout=10).stdout.splitlines()
+        except (OSError, subprocess.TimeoutExpired):
+            time.sleep(interval)
+            continue
+        now, down, up = {}, 0, 0
+        for line, info in zip(out, out[1:] + [""]):
+            m = _SS_SOCK.match(line)
+            if not m or _is_local(m.group(2)):
+                continue
+            if not any(int(p) in pids for p in _SS_PID.findall(m.group(3))):
+                continue
+            rcv = re.search(r"bytes_received:(\d+)", info)
+            snt = re.search(r"bytes_acked:(\d+)", info)
+            key = (m.group(1), m.group(2))
+            cur = (int(rcv.group(1)) if rcv else 0, int(snt.group(1)) if snt else 0)
+            now[key] = cur
+            if first:
+                continue   # connections that were open before this dashboard started: baseline only
+            prev = last.get(key, (0, 0))
+            down += max(0, cur[0] - prev[0]) if cur[0] >= prev[0] else cur[0]
+            up += max(0, cur[1] - prev[1]) if cur[1] >= prev[1] else cur[1]
+        last, first = now, False
+        if down or up:
+            day = time.strftime("%Y-%m-%d")
+            with bw_lock:
+                d = bw_days.setdefault(day, {"down": 0, "up": 0})
+                d["down"] += down
+                d["up"] += up
+        if time.time() - saved_at > 60:
+            save_bandwidth()
+            saved_at = time.time()
+        time.sleep(interval)
+
+
+def load_bandwidth():
+    try:
+        bw_days.update(json.loads(BW_FILE.read_text()).get("days", {}))
+    except (OSError, ValueError):
+        pass
+
+
+def save_bandwidth():
+    with bw_lock:
+        data = {"days": dict(sorted(bw_days.items())[-400:])}
+    try:
+        BW_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BW_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.replace(BW_FILE)
+    except OSError:
+        pass
+
+
+def bandwidth_report():
+    today = time.strftime("%Y-%m-%d")
+    week = {time.strftime("%Y-%m-%d", time.localtime(time.time() - k * 86400)) for k in range(7)}
+    month = time.strftime("%Y-%m")
+    with bw_lock:
+        days = dict(bw_days)
+    tot = lambda keys: {"down": sum(days[k]["down"] for k in keys), "up": sum(days[k]["up"] for k in keys)}
+    return {"today": days.get(today, {"down": 0, "up": 0}),
+            "week": tot([k for k in days if k in week]),
+            "month": tot([k for k in days if k.startswith(month)]),
+            "days": [{"day": k, **days[k]} for k in sorted(days, reverse=True)[:14]]}
+
+
 # ---------------------------------------------------------------- storage cleanup
 # clipper keeps its raw recording (.work/run_*/segments, VOD downloads, chat logs) and per-clip render files
 # (.work/<clip>/) and never deletes them at the end of a run; after a crash they include half-downloaded files.
@@ -622,6 +751,31 @@ def clipper_outs():
     return outs
 
 
+AUDIO_CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "hypecut" / "audio"
+AUDIO_CACHE_ROW = "VOD scan audio (cache)"
+
+
+def clipper_cmdlines():
+    out = []
+    for d in Path("/proc").iterdir():
+        if d.name.isdigit():
+            try:
+                c = (d / "cmdline").read_bytes().decode("utf-8", "replace")
+            except OSError:
+                continue
+            if "clipper.py" in c:
+                out.append(c)
+    return out
+
+
+def audio_cache_files():
+    """Cached scan audio, and whether a running clipper is using it (its video id is in the command line)."""
+    if not AUDIO_CACHE.is_dir():
+        return []
+    cmds = clipper_cmdlines()
+    return [(f, any(f.stem in c for c in cmds)) for f in AUDIO_CACHE.iterdir() if f.is_file()]
+
+
 def tmp_leftovers():
     return [p for p in Path(tempfile.gettempdir()).glob("hypecut-ai-*") if p.is_dir() and not p.is_symlink()]
 
@@ -634,6 +788,10 @@ def storage_report():
             items = leftover_items(d)
             if items:
                 rows.append({"folder": d.name, "bytes": sum(tree_size(p) for p in items), "in_use": d.name in busy})
+    cache = audio_cache_files()
+    if cache:
+        rows.append({"folder": AUDIO_CACHE_ROW, "bytes": sum(f.stat().st_size for f, busy_ in cache if not busy_),
+                     "in_use": all(b for _, b in cache)})
     return {"folders": rows, "tmp_bytes": sum(tree_size(p) for p in tmp_leftovers())}
 
 
@@ -641,6 +799,14 @@ def clean_storage(names=None):
     """Delete leftovers in the given folders (None = all not in use) plus stale /tmp previews. Returns bytes freed."""
     busy = clipper_outs()
     freed, skipped = 0, []
+    if names is None or AUDIO_CACHE_ROW in names:
+        for f, in_use in audio_cache_files():
+            if not in_use:
+                freed += f.stat().st_size
+                f.unlink(missing_ok=True)
+        names = [n for n in names if n != AUDIO_CACHE_ROW] if names else names
+        if names == []:
+            return {"freed": freed, "skipped_in_use": skipped}
     targets = [safe_folder(n) for n in names] if names else [d for d in ROOT.iterdir() if d.is_dir() and NAME_RE.match(d.name)]
     with fs_lock:
         for folder in targets:
@@ -964,7 +1130,7 @@ class Handler(BaseHTTPRequestHandler):
                 js_jobs = list(jobs.values())
                 js = [j.info() for j in sorted(js_jobs, key=lambda j: -j.started)]
             free = mem_available_gb()
-            return self.send_json({"jobs": js, "folders": output_folders(),
+            return self.send_json({"jobs": js, "folders": output_folders(), "bandwidth": bandwidth_report(),
                                    "mem_free_gb": round(free, 1) if free is not None else None,
                                    "job_mem_gb": JOB_MEM_GB,
                                    "render_mem_gb": 0 if any(j.running for j in js_jobs) else RENDER_MEM_GB})
@@ -1171,6 +1337,8 @@ def main():
     signal.signal(signal.SIGHUP, on_hangup)
     signal.signal(signal.SIGTERM, on_term)
     load_jobs()
+    load_bandwidth()
+    threading.Thread(target=bandwidth_watcher, daemon=True).start()
     threading.Thread(target=classify_worker, daemon=True).start()
     threading.Thread(target=auto_watcher, daemon=True).start()
     say(f"HypeCut dashboard: http://127.0.0.1:{args.port}   (Ctrl+C to quit)")
@@ -1194,6 +1362,7 @@ def main():
         except KeyboardInterrupt:
             for j in running:
                 j.stop(force=True)
+    save_bandwidth()
     say("bye")
 
 

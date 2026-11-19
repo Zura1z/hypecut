@@ -20,6 +20,9 @@ Usage:
 """
 import argparse
 import contextlib
+import shutil
+import urllib.error
+import urllib.request
 import json
 import math
 import os
@@ -134,6 +137,11 @@ def pick_encoder():
 # Source resolution + recording
 # --------------------------------------------------------------------------------------
 
+# among formats of the same (best) resolution prefer H.264 + AAC: YouTube serves VODs as AV1/VP9 by default,
+# and AV1 can't go into the .ts segments the pipeline cuts (the video stream silently disappears)
+FORMAT_SORT = ["res", "fps", "vcodec:h264", "acodec:aac"]
+
+
 def format_selector(min_h, max_h):
     """Best quality between min_h and max_h. No fallback below min_h: better no clip than a blurry one."""
     h = f"[height>={min_h}][height<={max_h}]"
@@ -153,7 +161,8 @@ class _QuietYDL:   # yt-dlp prints errors even with quiet=True; we log our own r
 
 def resolve_stream(url, min_h, max_h):
     import yt_dlp
-    opts = {"quiet": True, "no_warnings": True, "logger": _QuietYDL(), "format": format_selector(min_h, max_h)}
+    opts = {"quiet": True, "no_warnings": True, "logger": _QuietYDL(), "format": format_selector(min_h, max_h),
+            "format_sort": FORMAT_SORT, **js_runtime_opts()}
     try:
         with yt_dlp.YoutubeDL(opts) as y:
             info = y.extract_info(url, download=False)
@@ -782,6 +791,7 @@ class Clip:
     file: str = ""
     replaces: object = None   # earlier Clip this one supersedes (two moments merged into one clip)
     edges: str = "signals"    # who chose start/end: "signals", or "groq <model>: <why>"
+    vod_time: float | None = None   # VOD scan: where the clip starts in the original video (seconds)
 
 
 @contextlib.contextmanager
@@ -866,7 +876,7 @@ def explain(feats, i):
     return r
 
 
-def find_clips(tl, feats, frontier, avail, last_end, args, percentile, prev=None, ahead=0.0):
+def find_clips(tl, feats, frontier, avail, last_end, args, percentile, prev=None, ahead=0.0, skip_first=60):
     E = feats["E"]
     if avail - frontier < 3:
         return [], frontier
@@ -876,7 +886,7 @@ def find_clips(tl, feats, frontier, avail, last_end, args, percentile, prev=None
     # ahead of --target-per-hour (busy missions are full of peaks): only clearly bigger moments get through
     thr *= 1 + 0.12 * float(np.clip(ahead - 1, 0, 8))
     clips = []
-    i = max(frontier, 60)   # the first minute has no baseline yet, so its z-scores mean little
+    i = max(frontier, skip_first)   # the first minute of a stream has no baseline yet, so its z-scores mean little
     while i < avail:
         lo, hi = max(0, i - 8), min(len(E), i + 9)
         is_peak = E[i] >= thr and E[i] == E[lo:hi].max()
@@ -1061,6 +1071,261 @@ def groq_edges(tl, feats, clip, lo, args):
     clip.edges = f"groq {model.split('/')[-1]}: {v['reason'][:160]}"
     return True
 
+
+
+
+# --------------------------------------------------------------------------------------
+# Low-data live mode (YouTube): watch a low-res copy of the stream to find the moments, then fetch each clip at max
+# resolution from the stream's rewind buffer (YouTube keeps hours of it, as numbered 2 s pieces)
+# --------------------------------------------------------------------------------------
+
+def js_runtime_opts():
+    """YouTube needs a JavaScript runtime for the full format list; yt-dlp only looks for deno by default."""
+    for name in ("deno", "node", "bun"):
+        if shutil.which(name):
+            return {"js_runtimes": {name: {}}}
+    return {}
+
+
+class YouTubeRewind:
+    def __init__(self, url, max_h):
+        self.url, self.max_h = url, max_h
+        self.lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        import yt_dlp
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": _QuietYDL(), "live_from_start": True,
+                               **js_runtime_opts()}) as y:
+            info = y.extract_info(self.url, download=False)
+        fmts = [f for f in info.get("formats") or [] if f.get("is_from_start") and f.get("url")]
+        vids = [f for f in fmts if (f.get("height") or 0) <= self.max_h and f.get("vcodec") not in (None, "none")]
+        auds = [f for f in fmts if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
+        if not vids or not auds:
+            raise RuntimeError("this stream has no rewind buffer")
+        self.v = max(vids, key=lambda f: (f.get("height") or 0, f.get("fps") or 0,
+                                          "avc1" in (f.get("vcodec") or ""), f.get("tbr") or 0))
+        self.a = max(auds, key=lambda f: ("mp4a" in (f.get("acodec") or ""), f.get("abr") or f.get("tbr") or 0))
+        self.td = float(self.v.get("target_duration") or 2)
+        self.loaded = time.time()
+
+    @property
+    def label(self):
+        return f"{self.v.get('height')}p{int(self.v.get('fps') or 30)}"
+
+    def _req(self, f, sq=None, method="GET"):
+        from yt_dlp.utils import update_url_query
+        url = f["url"] if sq is None else update_url_query(f["url"], {"sq": str(sq)})
+        return urllib.request.Request(url, method=method, headers=f.get("http_headers") or {})
+
+    def fetch(self, wall0, wall1, out):
+        """Pieces covering wall-clock [wall0, wall1] (video + audio) merged into `out`. Returns (estimated wall time
+        of the file's first frame, bytes downloaded)."""
+        with self.lock:
+            for attempt in (0, 1):
+                if attempt or time.time() - self.loaded > 4 * 3600:   # the signed piece URLs expire after ~6 h
+                    self._load()
+                try:
+                    now = time.time()
+                    with urllib.request.urlopen(self._req(self.v, method="HEAD"), timeout=20) as r:
+                        head = int(r.headers["X-Head-Seqnum"])
+                    s0 = max(0, head - int(math.ceil((now - wall0) / self.td)))
+                    s1 = min(head, head - int((now - wall1) / self.td))
+                    total = 0
+                    for f, part in ((self.v, out.with_suffix(".v")), (self.a, out.with_suffix(".a"))):
+                        with open(part, "wb") as fh:
+                            for sq in range(s0, s1 + 1):
+                                with urllib.request.urlopen(self._req(f, sq), timeout=30) as r:
+                                    b = r.read()
+                                fh.write(b)
+                                total += len(b)
+                    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(out.with_suffix(".v")), "-i",
+                                        str(out.with_suffix(".a")), "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+                                        str(out)], capture_output=True, text=True)
+                    for ext in (".v", ".a"):
+                        out.with_suffix(ext).unlink(missing_ok=True)
+                    if r.returncode != 0:
+                        raise RuntimeError("merge failed: " + r.stderr.strip()[-200:])
+                    return now - (head - s0 + 1) * self.td, total
+                except urllib.error.HTTPError as e:
+                    if attempt == 0 and e.code in (403, 404, 410):
+                        continue
+                    raise
+
+
+def wall_of(tl, g):
+    """Wall-clock time at which global stream time `g` was recorded (segments know their wall start)."""
+    seg = min(tl.segs, key=lambda s: 0 if s.t0 <= g < s.t0 + s.dur else min(abs(g - s.t0), abs(g - s.t0 - s.dur)))
+    return seg.wall0 + (g - seg.t0)
+
+
+def align_audio(ref, ref_t0, path, est_t0, search=20.0):
+    """Global time of `path`'s first sample, by matching its loudness curve against the low-res recording's
+    (`ref`, starting at global `ref_t0`) within +-`search` s of the estimate. Returns (time, confidence)."""
+    hi = decode_audio(path)
+    fr = SR // 100   # 10 ms frames
+
+    def env(x):
+        n = len(x) // fr
+        e = np.log(1e-4 + np.sqrt((x[:n * fr].reshape(n, fr) ** 2).mean(axis=1)))
+        return (e - e.mean()) / (e.std() + 1e-6)
+    r, h = env(ref), env(hi)
+    if len(r) < 300 or len(h) < 300:
+        return est_t0, 0.0
+    cc = np.correlate(r, h, mode="full") / min(len(r), len(h))   # index k -> hi starts at ref frame k-(len(h)-1)
+    lags = np.arange(len(cc)) - (len(h) - 1)
+    exp = (est_t0 - ref_t0) * 100
+    ok = np.abs(lags - exp) <= search * 100
+    if not ok.any():
+        return est_t0, 0.0
+    k = int(np.argmax(np.where(ok, cc, -np.inf)))
+    return ref_t0 + lags[k] / 100.0, float(cc[k])
+
+
+class SourceView:
+    """Stands in for the Timeline when one clip is rendered from another video file on the same clock."""
+    def __init__(self, tl, segs):
+        self._tl, self.segs, self.layout = tl, segs, None
+
+    def __getattr__(self, k):
+        return getattr(self._tl, k)
+
+# --------------------------------------------------------------------------------------
+# VOD scan: find the moments from the audio, then download only those parts of the video
+# --------------------------------------------------------------------------------------
+SCAN_SR = 8000
+VOD_PRE, VOD_POST = 55.0, 50.0   # video downloaded around each scanned moment: build-up before, reaction after
+
+
+def scan_audio(path):
+    """Per-second loudness (dB) and brightness (share of energy above 2 kHz, high = screams) of a long audio
+    file, streamed through ffmpeg so an 11 h stream never sits in memory."""
+    p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(SCAN_SR),
+                          "-f", "s16le", "-"], stdout=subprocess.PIPE)
+    freqs = np.fft.rfftfreq(SCAN_SR, 1 / SCAN_SR)
+    hi = freqs > 2000
+    loud, bright = [], []
+    while True:
+        b = p.stdout.read(SCAN_SR * 2)
+        if len(b) < SCAN_SR:   # end (or a last fraction of a second)
+            break
+        x = np.frombuffer(b, np.int16).astype(np.float32) / 32768
+        loud.append(20 * math.log10(float(np.sqrt(np.mean(x * x))) + 1e-6))
+        spec = np.abs(np.fft.rfft(x, SCAN_SR)) ** 2
+        bright.append(float(spec[hi].sum() / (spec.sum() + 1e-9)))
+    p.wait()
+    return np.array(loud, np.float32), np.array(bright, np.float32)
+
+
+def rolling_z(arr, window=300, step=10):
+    """z-score of each second vs. the trailing `window` seconds (median / MAD), like Timeline._robust_z."""
+    n = len(arr)
+    med, mad = np.zeros(n, np.float32), np.ones(n, np.float32)
+    for i in range(0, n, step):
+        base = arr[max(0, i - window):max(i, 30)]
+        m = float(np.median(base))
+        med[i:i + step] = m
+        mad[i:i + step] = float(np.median(np.abs(base - m))) * 1.4826 + 1e-3
+    return (arr - med) / mad
+
+
+def scan_moments(loud, bright, heat, count, min_gap):
+    """The `count` strongest moments (second, score), strongest first: loud + high-pitched (screams) + a quiet
+    stretch turning loud (payoff), plus YouTube's most-replayed data when the video has it."""
+    smooth = lambda x, k: np.convolve(x, np.ones(k) / k, mode="same")
+    zl, zb = rolling_z(loud), rolling_z(bright)
+    lz = np.clip(zl, 0, 4)
+    scream = lz * np.clip(zb, 0, 3) / 3 * (zl > 1)
+    ls = smooth(lz, 3)
+    calm = np.array([ls[max(0, i - 25):max(1, i - 8)].mean() for i in range(len(ls))])
+    e = lz + 0.6 * scream + 0.4 * np.clip(ls - calm, 0, 4)
+    if heat:
+        h = np.zeros(len(e), np.float32)
+        for pt in heat:
+            h[int(pt["start_time"]):int(pt["end_time"]) + 1] = pt["value"]
+        e = e + 3.0 * h
+    e = smooth(e, 5)
+    e[:60] = 0   # the first minute has no baseline yet
+    picks = []
+    for i in np.argsort(-e):
+        if len(picks) >= count or e[i] <= 0:
+            break
+        if all(abs(int(i) - j) >= min_gap for j, _ in picks):
+            picks.append((int(i), float(e[i])))
+    return picks
+
+
+def run_vod_scan(args, info, audio_path, run_dir, whisper, renderer, use_groq, stop_evt):
+    """Score the whole VOD from its audio, then for the strongest moments (best first) download ~2.5 min of video
+    around each and clip it with the normal pipeline (face/emotion/motion, dynamic edges, captions, layout)."""
+    import yt_dlp
+    from yt_dlp.utils import download_range_func
+    log("scan: measuring the audio...")
+    loud, bright = scan_audio(audio_path)
+    dur = float(info.get("duration") or len(loud))
+    want = max(1, args.vod_clips)
+    picks = scan_moments(loud, bright, info.get("heatmap") or [], count=min(int(1.5 * want) + 2, 60),
+                         min_gap=max(args.min_gap, 90))
+    log(f"scan: {len(loud) / 3600:.1f} h of audio -> {len(picks)} candidate moments; downloading only those "
+        f"(~{VOD_PRE + VOD_POST:.0f} s each), best first, until {want} clips")
+    layout, submitted = None, 0
+    for k, (peak, score) in enumerate(picks):
+        if stop_evt.is_set() or submitted >= want:
+            break
+        a, b = max(0.0, peak - VOD_PRE), min(dur, peak + VOD_POST)
+        wdir = run_dir / f"win_{k:03d}"
+        wdir.mkdir(exist_ok=True)
+        log(f"scan: moment {k + 1}/{len(picks)} at {int(peak // 3600)}:{int(peak % 3600 // 60):02d}:"
+            f"{int(peak % 60):02d} (score {score:.1f}): downloading {b - a:.0f}s")
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": _QuietYDL(),
+                                   "outtmpl": str(wdir / "part.%(ext)s"), "merge_output_format": "mp4",
+                                   "format": format_selector(args.min_height, args.max_height),
+                                   "format_sort": FORMAT_SORT,
+                                   "download_ranges": download_range_func(None, [(a, b)])}) as y:
+                y.download([args.source])
+            src = next(p for p in wdir.glob("part.*") if p.suffix in (".mp4", ".mkv", ".webm"))
+        except Exception as e:
+            log(f"scan: download failed ({e.__class__.__name__}: {str(e)[:120]}); skipping this moment")
+            continue
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src), "-map", "0:v:0",
+                        "-map", "0:a:0?", "-c", "copy", "-f", "segment", "-segment_time", str(args.seg_time),
+                        "-segment_format", "matroska", str(wdir / "seg_%06d.mkv")], check=False)
+        segs = sorted(wdir.glob("seg_*.mkv"), key=lambda q: int(q.stem.split("_")[1]))
+        if segs:
+            src.unlink(missing_ok=True)   # the pieces hold the same data
+        if segs and not subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                        "stream=codec_name", "-of", "csv=p=0", str(segs[0])],
+                                       capture_output=True, text=True).stdout.strip():
+            log("scan: this window has no video stream; skipping")
+            continue
+        if not segs:
+            continue
+        wtl = Timeline(whisper, args.language, args.chat_lag)
+        wtl.heat = []
+        lay = detect_layout(sample_frames([str(q) for q in segs], n=8))
+        if lay and lay["mode"] != "blur":
+            layout = steadier_layout(lay, layout)
+        wtl.layout = layout
+        for q in segs:
+            wtl.add_segment(int(q.stem.split("_")[1]), q, q.stat().st_mtime)
+        feats = wtl.features([])
+        local_peak = peak - a
+        # inside a window everything is already a candidate: low bars, then take the clip at the scanned moment
+        wargs = argparse.Namespace(**{**vars(args), "warmup": 0, "threshold": 0.5})
+        cands, _ = find_clips(wtl, feats, 0, len(feats["E"]), -1e9, wargs, 50, skip_first=0)
+        if not cands:
+            log("scan: nothing clip-worthy in this window; next")
+            continue
+        c = max(cands, key=lambda c_: c_.score - 0.15 * abs((c_.start + c_.end) / 2 - local_peak))
+        if use_groq and wtl.words:
+            groq_edges(wtl, feats, c, 0.0, args)
+        c.vod_time = round(a + c.start, 1)
+        c.reasons = c.reasons + [f"VOD {int(c.vod_time // 3600)}:{int(c.vod_time % 3600 // 60):02d}:"
+                                 f"{int(c.vod_time % 60):02d}"]
+        renderer.submit(c, wtl, feats)
+        submitted += 1
+    return submitted
 
 # --------------------------------------------------------------------------------------
 # Layout detection (facecam)
@@ -1681,6 +1946,7 @@ def romanize(word):
 class Renderer:
     def __init__(self, outdir, args):
         self.outdir = Path(outdir)
+        self.rewind = None   # YouTubeRewind in low-data live mode
         self.args = args
         self.enc_pre, self.enc_vf, self.enc = pick_encoder()
         self.last_layout = None
@@ -1920,16 +2186,52 @@ class Renderer:
                 if item is None:
                     break
                 clip, tl, feats = item
+                src, hires = tl, None
                 try:
+                    if self.rewind is not None:
+                        try:
+                            src, hires = self.hires_source(clip, tl)
+                        except Exception as e:
+                            log(f"hi-res: couldn't fetch this clip from the stream's rewind ({e.__class__.__name__}: "
+                                f"{str(e)[:120]}); rendering from the low-res recording")
                     with render_turn():
-                        out = self.render(clip, tl, feats)
+                        out = self.render(clip, src, feats)
                     self.on_done(clip, out)
                 except Exception as e:
                     log(f"render error: {e.__class__.__name__}: {e}")
                 finally:
+                    if hires is not None:
+                        hires.unlink(missing_ok=True)
                     self.q.task_done()
         self.worker = threading.Thread(target=loop, daemon=True)
         self.worker.start()
+
+    def hires_source(self, clip, tl, margin=20.0):
+        """Fetch [clip.start - margin, clip.end + margin] at max resolution from the YouTube rewind buffer and place
+        it on the global clock by matching its audio against the low-res recording."""
+        g0, g1 = clip.start - margin, clip.end + margin
+        d = self.outdir / ".work" / "hires"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{int(clip.start)}_{int(time.time())}.mp4"
+        wall0 = wall_of(tl, g0)
+        wstart, nbytes = self.rewind.fetch(wall0, wall_of(tl, g1), path)
+        est = g0 + (wstart - wall0)
+        near = [q for q in tl.segs if q.t0 < g1 + 5 and q.t0 + q.dur > g0 - 5 and Path(q.path).exists()]
+        if not near:
+            raise RuntimeError("low-res segments already deleted")
+        ref = np.concatenate([decode_audio(q.path) for q in near])
+        g_start, conf = align_audio(ref, near[0].t0, path, est)
+        dur = probe_duration(path)
+        if conf < 0.3:
+            log(f"hi-res: audio match weak ({conf:.2f}); using the clock estimate")
+            g_start = est
+        if not (g_start <= clip.start - 0.5 and g_start + dur >= clip.end + 0.5):
+            path.unlink(missing_ok=True)
+            raise RuntimeError(f"fetched piece {g_start:.0f}-{g_start + dur:.0f}s doesn't cover the clip "
+                               f"{clip.start:.0f}-{clip.end:.0f}s")
+        log(f"hi-res: fetched {self.rewind.label} for {clip.start:.0f}-{clip.end:.0f}s ({nbytes / 1e6:.0f} MB), "
+            f"aligned {g_start - est:+.1f}s (match {conf:.2f})")
+        return SourceView(tl, [Segment(0, str(path.resolve()), g_start, dur, wstart)]), path
 
     def submit(self, clip, tl, feats):
         self.q.put((clip, tl, feats))
@@ -2039,7 +2341,8 @@ class Renderer:
         frames = sample_frames([s.path for s in segs], n=10) if self.args.layout != "blur" else []
         if self.args.layout != "blur":
             layout = detect_layout(frames)
-            known = self.last_layout or tl.layout
+            known = next((k for k in (self.last_layout, tl.layout)
+                          if k and (layout is None or k.get("W") == layout.get("W"))), None)
             layout = steadier_layout(layout, known) if layout and layout["mode"] == "split" else layout
             want = "split" if self.args.layout in ("float", "stack") else self.args.layout   # rendered from a split detection
             if layout and want in ("split", "track") and layout["mode"] != want:
@@ -2281,6 +2584,18 @@ def main():
     ap.add_argument("--max-height", type=int, default=4320, help="cap source resolution (default: best available)")
     ap.add_argument("--min-height", type=int, default=1080,
                     help="refuse sources below this resolution instead of recording lower quality")
+    ap.add_argument("--live-lowres", choices=["auto", "off"], default="auto",
+                    help="YouTube lives: watch a low-res copy (--watch-height) to find the moments and fetch each clip "
+                         "at max resolution from the stream's rewind - much less data; off = record at full resolution")
+    ap.add_argument("--watch-height", type=int, default=480,
+                    help="low-data live mode: resolution watched to find the moments (lower = less data, but face "
+                         "and emotion detection on a small facecam get weaker)")
+    ap.add_argument("--vod-mode", choices=["scan", "full"], default="scan",
+                    help="uploaded videos: scan = download the audio, find the moments, then download only ~2.5 min "
+                         "of video around each; full = download the whole video first")
+    ap.add_argument("--vod-scan-min", type=float, default=20,
+                    help="only scan videos at least this many minutes long (shorter ones are downloaded whole)")
+    ap.add_argument("--vod-clips", type=int, default=20, help="scan mode: how many clips to make from a video")
     ap.add_argument("--keep-minutes", type=float, default=20,
                     help="live mode: delete raw segments older than this (0 = keep everything)")
     ap.add_argument("--duration", type=float, default=0, help="live mode: stop after N minutes (0 = until stream ends)")
@@ -2308,6 +2623,8 @@ def main():
 
     is_file = Path(args.source).exists()
     live = False
+    vod_scan = False
+    rewind = None
     stop_evt = threading.Event()
     recorder = None
     chat = ChatCounter()
@@ -2320,19 +2637,43 @@ def main():
             sys.exit(f"source rejected: {e}")
         live = bool(info.get("is_live"))
         log(f"source: {info.get('title')} | {info.get('uploader') or info.get('channel')} | live={live}")
-        if not live:
+        vod_scan = (not live and args.vod_mode == "scan"
+                    and (info.get("duration") or 0) >= args.vod_scan_min * 60)
+        if vod_scan:
+            heatmap = info.get("heatmap") or []
+            log(f"not live, {(info.get('duration') or 0) / 3600:.1f} h -> scan mode: downloading the audio only "
+                f"to find the moments" + (f" (+ YouTube most-replayed data)" if heatmap else ""))
+            import yt_dlp
+            # one cache for every job (a restart, or the same video in another folder, reuses it)
+            cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "hypecut" / "audio"
+            cache.mkdir(parents=True, exist_ok=True)
+            vid = re.sub(r"[^A-Za-z0-9_-]", "_", str(info.get("id") or "video"))
+            audio_path = next((p for p in cache.glob(f"{vid}.*") if not p.name.endswith((".part", ".ytdl"))), None)
+            if audio_path:
+                log(f"scan: reusing the audio downloaded earlier ({audio_path.stat().st_size / 1e6:.0f} MB)")
+            else:
+                # loudness and pitch don't need hi-fi: the lowest-bitrate audio (~48 kbps, ~0.25 GB for 11 h)
+                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": _QuietYDL(),
+                                       "outtmpl": str(cache / f"{vid}.%(ext)s"),
+                                       "format": "worstaudio[abr>=32]/worstaudio/bestaudio"}) as y:
+                    y.download([args.source])
+                audio_path = next(p for p in cache.glob(f"{vid}.*") if not p.name.endswith((".part", ".ytdl")))
+        elif not live:
             heatmap = info.get("heatmap") or []
             log("not live -> downloading the video first"
                 + (f" (YouTube most-replayed data: {len(heatmap)} points)" if heatmap else ""))
             import yt_dlp
             dst = run_dir / "source.%(ext)s"
             with yt_dlp.YoutubeDL({"quiet": True, "outtmpl": str(dst), "merge_output_format": "mp4",
-                                   "format": format_selector(args.min_height, args.max_height)}) as y:
+                                   "format": format_selector(args.min_height, args.max_height),
+                                   "format_sort": FORMAT_SORT}) as y:
                 y.download([args.source])
             args.source = str(next(run_dir.glob("source.*")))
             is_file = True
 
-    if is_file:
+    if vod_scan:
+        pass
+    elif is_file:
         h = probe_height(args.source)
         if h and h < args.min_height:
             sys.exit(f"source rejected: {args.source} is {h}p, below --min-height {args.min_height}")
@@ -2341,7 +2682,17 @@ def main():
                         "-map", "0:a:0?", "-c", "copy", "-f", "segment", "-segment_time", str(args.seg_time),
                         str(segdir / "seg_%06d.ts")], check=True)
     else:
-        recorder = Recorder(args.source, segdir, args.seg_time, args.min_height, args.max_height)
+        rec_min, rec_max = args.min_height, args.max_height
+        host = args.source.lower()
+        if args.live_lowres == "auto" and ("youtube.com" in host or "youtu.be" in host):
+            try:
+                rewind = YouTubeRewind(args.source, args.max_height)
+                rec_min, rec_max = 0, args.watch_height
+                log(f"low-data live: watching at {args.watch_height}p to find the moments; each clip is fetched at "
+                    f"{rewind.label} from the stream's rewind")
+            except Exception as e:
+                log(f"low-data live unavailable ({str(e)[:100]}); recording at full resolution")
+        recorder = Recorder(args.source, segdir, args.seg_time, rec_min, rec_max)
         recorder.start()
         if not args.no_chat:
             host = args.source.lower()
@@ -2386,6 +2737,7 @@ def main():
     tl = Timeline(whisper, args.language, args.chat_lag)
     tl.heat = heatmap
     renderer = Renderer(outdir, args)
+    renderer.rewind = rewind
     made = 0
 
     def on_done(c, out):
@@ -2396,6 +2748,16 @@ def main():
                 f"{'ai=' + str(c.ai_score) + ' ' if c.ai_score else ''}| {'; '.join(c.reasons) or 'overall energy'}")
 
     renderer.start_worker(on_done)
+    if vod_scan:
+        signal.signal(signal.SIGINT, lambda *_: stop_evt.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop_evt.set())
+        run_vod_scan(args, info, audio_path, run_dir, whisper, renderer, use_groq, stop_evt)
+        log("finishing queued renders...")
+        renderer.finish()
+        stop_evt.set()
+        log(f"done. {len([p for p in outdir.glob('*.mp4') if not p.name.endswith('_meme.mp4')])} clip(s) in "
+            f"{outdir.resolve()}")
+        return
     done_idx = set()
     frontier, last_end = 0, -1e9
     prev_clip = None

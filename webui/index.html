@@ -21,6 +21,13 @@ body { margin: 0; background: var(--bg); color: var(--ink);
 header { padding: 14px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 12px; }
 header h1 { margin: 0; font-size: 20px; letter-spacing: -.01em; }
 header span { color: var(--muted); font-size: 13px; }
+header { position: relative; flex-wrap: wrap; }
+.bw { margin-left: auto; font-size: 13px; padding: 4px 10px; font-variant-numeric: tabular-nums; }
+.bwpop { position: absolute; right: 20px; top: 52px; z-index: 5; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 14px; font-size: 13px; min-width: 260px; box-shadow: 0 6px 24px rgba(0,0,0,.25); }
+.bwpop table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.bwpop td { padding: 2px 6px; } .bwpop td:not(:first-child) { text-align: right; }
+.bwpop .muted { color: var(--muted); }
 main { display: grid; grid-template-columns: minmax(300px, 420px) 1fr; gap: 20px; padding: 20px; align-items: start; }
 @media (max-width: 860px) { main { grid-template-columns: 1fr; padding: 16px; } }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 20px; }
@@ -93,7 +100,10 @@ button.suggest { box-shadow: 0 0 0 2px var(--accent); }
 </style>
 </head>
 <body>
-<header><h1>HypeCut</h1><span>paste a stream, get vertical clips</span></header>
+<header><h1>HypeCut</h1><span>paste a stream, get vertical clips</span>
+  <button id="bw" class="bw" title="network used by HypeCut (downloads ↓ / uploads ↑); click for each day">bandwidth …</button>
+  <div id="bwpop" class="bwpop" hidden></div>
+</header>
 <main>
   <div>
     <section>
@@ -116,6 +126,12 @@ button.suggest { box-shadow: 0 0 0 2px var(--accent); }
           <div><label for="dur">Stop after (minutes)</label><input id="dur" type="number" min="0" step="any" placeholder="until stream ends"></div>
           <div><label for="minh">Min source height</label>
             <select id="minh"><option value="">any</option><option>480</option><option>720</option><option>1080</option></select></div>
+          <div><label for="watch" title="YouTube lives: the stream is watched at this resolution to find the moments; each clip is then fetched at max resolution from the stream's rewind">Live watch quality (data)</label>
+            <select id="watch"><option value="480">480p (~0.6 GB/h)</option><option value="360">360p (~0.4 GB/h, weaker face check)</option>
+              <option value="720">720p (~1.3 GB/h)</option><option value="full">full resolution (~2.5 GB/h)</option></select></div>
+          <div><label for="maxh" title="caps what is downloaded: a 100 s VOD window is ~40-50 MB at 1080p, ~100 MB at 1440p">Max resolution (data)</label>
+            <select id="maxh"><option value="">best available</option><option value="1440">1440p</option>
+              <option value="1080">1080p (less data)</option><option value="720">720p (least)</option></select></div>
         </div>
         <div class="checks">
           <label><input type="checkbox" id="captions"> captions</label>
@@ -178,7 +194,7 @@ let lastJobs = [];
 function options() {
   return {
     layout: $("#layout").value, target_per_hour: $("#tph").value, duration: $("#dur").value,
-    min_height: $("#minh").value, captions: $("#captions").checked,
+    min_height: $("#minh").value, max_height: $("#maxh").value, watch: $("#watch").value, captions: $("#captions").checked,
     ai_cam: $("#aicam").checked, auto_classify: $("#autocls").checked,
   };
 }
@@ -267,6 +283,30 @@ $("#addstream").addEventListener("click", () => {
   streams.push(""); store.set("streams", streams); renderStreams();
   const inputs = document.querySelectorAll("#streams .srow input"); inputs[inputs.length - 1].focus();
 });
+
+// ---- bandwidth used by HypeCut (header)
+let lastBw = null;
+function renderBandwidth(b) {
+  if (!b) return;
+  lastBw = b;
+  const t = b.today;
+  $("#bw").textContent = `today ↓ ${fmtBytes(t.down)} · ↑ ${fmtBytes(t.up)}`;
+  if (!$("#bwpop").hidden) fillBwPop();
+}
+function fillBwPop() {
+  const b = lastBw; if (!b) return;
+  $("#bwpop").innerHTML = `<table>
+    <tr class="muted"><td></td><td>↓ down</td><td>↑ up</td></tr>
+    <tr><td>today</td><td>${fmtBytes(b.today.down)}</td><td>${fmtBytes(b.today.up)}</td></tr>
+    <tr><td>last 7 days</td><td>${fmtBytes(b.week.down)}</td><td>${fmtBytes(b.week.up)}</td></tr>
+    <tr><td>this month</td><td>${fmtBytes(b.month.down)}</td><td>${fmtBytes(b.month.up)}</td></tr>
+    <tr><td colspan="3" class="muted" style="padding-top:8px">per day</td></tr>
+    ${b.days.map(d => `<tr><td>${d.day}</td><td>${fmtBytes(d.down)}</td><td>${fmtBytes(d.up)}</td></tr>`).join("")
+      || '<tr><td colspan="3" class="muted">nothing counted yet</td></tr>'}
+  </table><div class="muted" style="margin-top:6px">Counts only HypeCut (the dashboard, clippers, yt-dlp, ffmpeg), while the dashboard runs.</div>`;
+}
+$("#bw").addEventListener("click", e => { e.stopPropagation(); $("#bwpop").hidden = !$("#bwpop").hidden; fillBwPop(); });
+document.addEventListener("click", e => { if (!e.target.closest("#bwpop")) $("#bwpop").hidden = true; });
 
 // ---- storage: leftover recordings / render files
 const fmtBytes = n => n >= 1e9 ? (n / 1073741824).toFixed(1) + " GB" : n >= 1e6 ? Math.round(n / 1048576) + " MB" : Math.round(n / 1024) + " KB";
@@ -447,7 +487,7 @@ $("#gallery").addEventListener("click", async e => {
 async function refresh(force = false) {
   try {
     const s = await api("/api/state");
-    lastJobs = s.jobs; updateStreamRows();
+    lastJobs = s.jobs; updateStreamRows(); renderBandwidth(s.bandwidth);
     await renderJobs(s.jobs);
     if (s.mem_free_gb != null) {
       const fits = Math.max(0, Math.floor((s.mem_free_gb - s.render_mem_gb) / s.job_mem_gb));
@@ -460,7 +500,7 @@ async function refresh(force = false) {
 }
 current = store.get("folder", null);
 // form: remember the options (and an unsent URL list) across reloads
-const formIds = ["layout", "tph", "dur", "minh", "captions", "aicam", "autocls"];
+const formIds = ["layout", "tph", "dur", "minh", "maxh", "watch", "captions", "aicam", "autocls"];
 const formState = store.get("form", {});
 if (formState.urls && !store.get("streams", null)) {   // older page kept a textarea of links
   streams = formState.urls.split(/[\s,]+/).filter(Boolean); if (!streams.length) streams = [""];
