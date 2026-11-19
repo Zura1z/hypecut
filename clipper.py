@@ -2089,8 +2089,11 @@ class Renderer:
             keep.append((cur, clip.end))
             cuts = [(x, y) for x, y in keep if y - x > 0.3] or cuts
         teaser = 0.0
-        if not a.no_teaser and clip.peak - cuts[0][0] > 5:
-            t0, t1 = clip.peak - 0.5, min(clip.end, clip.peak + 1.5)
+        n = a.teaser_len
+        if not a.no_teaser and n > 0 and clip.peak - cuts[0][0] > n:
+            # the hook: from just before the peak through the reaction (2 s before / 5 s after for a 7 s hook)
+            t0 = max(cuts[0][0], clip.peak - n * 2 / 7)
+            t1 = min(clip.end, t0 + n)
             cuts = [(t0, t1)] + cuts
             teaser = t1 - t0
         return cuts, teaser
@@ -2457,6 +2460,10 @@ class Renderer:
         return None
 
     def render(self, clip, tl, feats=None):
+        a = self.args
+        if (a.no_teaser or clip.peak - clip.start <= a.teaser_len) and clip.end - clip.start < a.clip_min:
+            # no hook for this clip (its peak is right at the start): play on so it still reaches --min-len
+            clip.end = min(tl.end, clip.start + a.clip_min)
         segs = [s for s in tl.segs if s.t0 < clip.end + 0.5 and s.t0 + s.dur > clip.start - 1]
         segs = [s for s in segs if Path(s.path).exists()]
         if not segs:
@@ -2653,8 +2660,9 @@ def main():
     ap = argparse.ArgumentParser(description="Record a live stream and keep cutting vertical viral clips.")
     ap.add_argument("source", help="live stream URL (YouTube/Twitch/Kick/...), VOD URL, or local video file")
     ap.add_argument("--out", default="clips", help="output folder for clips")
-    ap.add_argument("--min-len", type=float, default=15)
-    ap.add_argument("--max-len", type=float, default=75,
+    ap.add_argument("--min-len", type=float, default=70,
+                    help="shortest clip in seconds (the build-up and the reaction are padded out to this)")
+    ap.add_argument("--max-len", type=float, default=90,
                     help="clips grow with the moment (build-up + reaction) up to this length")
     ap.add_argument("--min-gap", type=float, default=12, help="min seconds between clips")
     ap.add_argument("--target-per-hour", type=float, default=12,
@@ -2665,7 +2673,9 @@ def main():
     ap.add_argument("--dead-air", type=float, default=0.7, help="silences longer than this get jump-cut")
     ap.add_argument("--jump-cuts", dest="no_jump_cuts", action="store_false", default=True,
                     help="cut silent gaps out of clips (off by default: makes the picture jump)")
-    ap.add_argument("--no-teaser", action="store_true", help="don't open with a 2s flash of the peak")
+    ap.add_argument("--no-teaser", action="store_true", help="don't open with a flash of the peak (the hook)")
+    ap.add_argument("--teaser-len", type=float, default=7,
+                    help="hook: seconds of the peak shown first, before the clip plays from the start")
     ap.add_argument("--no-zoom", action="store_true")
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("--cam-upscale", type=float, default=2.4,
@@ -2730,6 +2740,11 @@ def main():
                     help="live mode: delete raw segments older than this (0 = keep everything)")
     ap.add_argument("--duration", type=float, default=0, help="live mode: stop after N minutes (0 = until stream ends)")
     args = ap.parse_args()
+    # --min-len / --max-len are the length of the finished clip, hook included; the stretch taken from the stream
+    # (what clip selection works with) is shorter by the hook
+    hook = 0.0 if args.no_teaser else max(0.0, args.teaser_len)
+    args.clip_min, args.clip_max = args.min_len, args.max_len
+    args.min_len, args.max_len = max(5.0, args.min_len - hook), max(10.0, args.max_len - hook)
     global MAX_CAM_UPSCALE, SHARPEN
     MAX_CAM_UPSCALE, SHARPEN = args.cam_upscale, not args.no_sharpen
     import shutil
