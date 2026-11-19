@@ -1118,6 +1118,42 @@ class YouTubeRewind:
         url = f["url"] if sq is None else update_url_query(f["url"], {"sq": str(sq)})
         return urllib.request.Request(url, method=method, headers=f.get("http_headers") or {})
 
+    def _http(self, url, headers, method="GET", hops=3):
+        """One request over a kept-alive connection per host (cheaper, and visible to the dashboard's bandwidth
+        counter, which can't see connections that open and close between its polls)."""
+        import http.client
+        from urllib.parse import urlsplit
+        pool = self.__dict__.setdefault("_conns", {})
+        u = urlsplit(url)
+        for attempt in (0, 1):
+            conn = pool.get(u.netloc)
+            if conn is None:
+                conn = pool[u.netloc] = http.client.HTTPSConnection(u.netloc, timeout=30)
+            try:
+                conn.request(method, u.path + ("?" + u.query if u.query else ""), headers=headers)
+                r = conn.getresponse()
+                body = r.read()
+            except (http.client.HTTPException, OSError):
+                conn.close()
+                pool.pop(u.netloc, None)
+                if attempt:
+                    raise
+                continue
+            if r.status in (301, 302, 303, 307, 308) and hops and r.getheader("Location"):
+                return self._http(r.getheader("Location"), headers, method, hops - 1)
+            if r.status >= 400:
+                raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, None)
+            return r, body
+
+    def head(self):
+        """Number of the newest piece (a HEAD request: no data)."""
+        r, _ = self._http(self.v["url"], self.v.get("http_headers") or {}, method="HEAD")
+        return int(r.getheader("X-Head-Seqnum"))
+
+    def get(self, f, sq):
+        from yt_dlp.utils import update_url_query
+        return self._http(update_url_query(f["url"], {"sq": str(sq)}), f.get("http_headers") or {})[1]
+
     def fetch(self, wall0, wall1, out):
         """Pieces covering wall-clock [wall0, wall1] (video + audio) merged into `out`. Returns (estimated wall time
         of the file's first frame, bytes downloaded)."""
@@ -1127,16 +1163,14 @@ class YouTubeRewind:
                     self._load()
                 try:
                     now = time.time()
-                    with urllib.request.urlopen(self._req(self.v, method="HEAD"), timeout=20) as r:
-                        head = int(r.headers["X-Head-Seqnum"])
+                    head = self.head()
                     s0 = max(0, head - int(math.ceil((now - wall0) / self.td)))
                     s1 = min(head, head - int((now - wall1) / self.td))
                     total = 0
                     for f, part in ((self.v, out.with_suffix(".v")), (self.a, out.with_suffix(".a"))):
                         with open(part, "wb") as fh:
                             for sq in range(s0, s1 + 1):
-                                with urllib.request.urlopen(self._req(f, sq), timeout=30) as r:
-                                    b = r.read()
+                                b = self.get(f, sq)
                                 fh.write(b)
                                 total += len(b)
                     r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(out.with_suffix(".v")), "-i",
@@ -1151,6 +1185,84 @@ class YouTubeRewind:
                     if attempt == 0 and e.code in (403, 404, 410):
                         continue
                     raise
+
+
+class YouTubePieceRecorder(threading.Thread):
+    """Records a YouTube live stream by fetching its numbered 2 s pieces as they appear (same interface as Recorder).
+    ffmpeg's HLS reader re-downloads the stream's playlist - every piece of the hours-long rewind window, ~0.5-1 MB -
+    every few seconds for video and audio, which at 480p was 75-90% of all the data; this only fetches new pieces."""
+
+    def __init__(self, url, segdir, seg_time, max_h):
+        super().__init__(daemon=True)
+        self.url, self.segdir, self.seg_time = url, Path(segdir), seg_time
+        self.stop_evt = threading.Event()
+        self.proc = None
+        self.ended = False
+        self.rw = YouTubeRewind(url, max_h)
+
+    def stop(self):
+        self.stop_evt.set()
+
+    def _next_index(self):
+        nums = [int(p.stem.split("_")[1]) for p in self.segdir.glob("seg_*.ts")]
+        return max(nums) + 1 if nums else 0
+
+    def run(self):
+        per = max(1, round(self.seg_time / self.rw.td))   # pieces per segment
+        idx, nxt, stalled_since, fails = self._next_index(), None, time.time(), 0
+        log(f"recorder: recording at {self.rw.label} from the stream's pieces ({self.rw.td:.0f} s each, no playlist)")
+        while not self.stop_evt.is_set():
+            try:
+                head = self.rw.head()
+                if nxt is None:
+                    nxt = max(0, head - per + 1)   # start at the live edge
+                if head - nxt + 1 < per:
+                    if time.time() - stalled_since > 120:   # no new pieces for 2 minutes: did the stream end?
+                        self.rw._load()                     # raises once it's no longer live
+                        stalled_since = time.time()
+                    time.sleep(1)
+                    continue
+                stalled_since = time.time()
+                seqs = range(nxt, nxt + per)
+                tmp = self.segdir / f".rec_{idx:06d}"
+                for f, ext in ((self.rw.v, ".v"), (self.rw.a, ".a")):
+                    with open(tmp.with_suffix(ext), "wb") as fh:
+                        for sq in seqs:
+                            fh.write(self.rw.get(f, sq))
+                r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(tmp.with_suffix(".v")), "-i",
+                                    str(tmp.with_suffix(".a")), "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+                                    "-f", "mpegts", str(tmp.with_suffix(".ts"))], capture_output=True, text=True)
+                for ext in (".v", ".a"):
+                    tmp.with_suffix(ext).unlink(missing_ok=True)
+                if r.returncode == 0:
+                    tmp.with_suffix(".ts").replace(self.segdir / f"seg_{idx:06d}.ts")   # appears complete
+                    idx += 1
+                else:
+                    log(f"recorder: couldn't join pieces {nxt}-{nxt + per - 1}: {r.stderr.strip()[-150:]}")
+                nxt += per
+                fails = 0
+            except urllib.error.HTTPError as e:
+                fails += 1
+                if e.code in (403, 404, 410):
+                    try:
+                        self.rw._load()   # signed URLs expired, or the stream changed
+                    except Exception as e2:
+                        log(f"recorder: stream is no longer available ({str(e2)[:80]})")
+                        break
+                if fails >= 10:
+                    log(f"recorder: giving up after repeated errors (HTTP {e.code})")
+                    break
+                time.sleep(3)
+            except RuntimeError as e:   # _load: no rewind formats any more = the live ended
+                log(f"recorder: stream is no longer live ({str(e)[:80]})")
+                break
+            except Exception as e:   # network blip
+                fails += 1
+                if fails >= 10:
+                    log(f"recorder: giving up after repeated errors ({e.__class__.__name__})")
+                    break
+                time.sleep(3)
+        self.ended = True
 
 
 def wall_of(tl, g):
@@ -1947,6 +2059,7 @@ class Renderer:
     def __init__(self, outdir, args):
         self.outdir = Path(outdir)
         self.rewind = None   # YouTubeRewind in low-data live mode
+        self.rewind_bias, self.rewind_n = 0.0, 0   # learned clock offset of the rewind pieces (s)
         self.args = args
         self.enc_pre, self.enc_vf, self.enc = pick_encoder()
         self.last_layout = None
@@ -2206,31 +2319,39 @@ class Renderer:
         self.worker = threading.Thread(target=loop, daemon=True)
         self.worker.start()
 
-    def hires_source(self, clip, tl, margin=20.0):
-        """Fetch [clip.start - margin, clip.end + margin] at max resolution from the YouTube rewind buffer and place
-        it on the global clock by matching its audio against the low-res recording."""
+    def hires_source(self, clip, tl):
+        """Fetch the clip's stretch at max resolution from the YouTube rewind buffer and place it on the global clock
+        by matching its audio against the low-res recording. The clock estimate is off by a steady few seconds per
+        stream (latency): once one clip has measured it, the fetch is shifted by it and the margin shrinks from 20 s
+        to 8 s on each side, which is ~35-45% less data per clip."""
+        learned = self.rewind_n > 0
+        margin, bias = (8.0, self.rewind_bias) if learned else (20.0, 0.0)
         g0, g1 = clip.start - margin, clip.end + margin
         d = self.outdir / ".work" / "hires"
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"{int(clip.start)}_{int(time.time())}.mp4"
         wall0 = wall_of(tl, g0)
-        wstart, nbytes = self.rewind.fetch(wall0, wall_of(tl, g1), path)
-        est = g0 + (wstart - wall0)
+        wstart, nbytes = self.rewind.fetch(wall0 - bias, wall_of(tl, g1) - bias, path)
+        est = g0 + (wstart - wall0) + bias   # expected global time of the piece's first frame
         near = [q for q in tl.segs if q.t0 < g1 + 5 and q.t0 + q.dur > g0 - 5 and Path(q.path).exists()]
         if not near:
             raise RuntimeError("low-res segments already deleted")
         ref = np.concatenate([decode_audio(q.path) for q in near])
-        g_start, conf = align_audio(ref, near[0].t0, path, est)
+        g_start, conf = align_audio(ref, near[0].t0, path, est, search=12.0 if learned else 20.0)
         dur = probe_duration(path)
         if conf < 0.3:
             log(f"hi-res: audio match weak ({conf:.2f}); using the clock estimate")
             g_start = est
+        elif conf >= 0.5:   # learn this stream's steady clock offset
+            off = g_start - (est - bias)
+            self.rewind_bias = off if not learned else 0.7 * self.rewind_bias + 0.3 * off
+            self.rewind_n += 1
         if not (g_start <= clip.start - 0.5 and g_start + dur >= clip.end + 0.5):
             path.unlink(missing_ok=True)
             raise RuntimeError(f"fetched piece {g_start:.0f}-{g_start + dur:.0f}s doesn't cover the clip "
                                f"{clip.start:.0f}-{clip.end:.0f}s")
-        log(f"hi-res: fetched {self.rewind.label} for {clip.start:.0f}-{clip.end:.0f}s ({nbytes / 1e6:.0f} MB), "
-            f"aligned {g_start - est:+.1f}s (match {conf:.2f})")
+        log(f"hi-res: fetched {self.rewind.label} for {clip.start:.0f}-{clip.end:.0f}s ({nbytes / 1e6:.0f} MB, "
+            f"{dur:.0f}s of video, margin {margin:.0f}s), aligned {g_start - est:+.1f}s (match {conf:.2f})")
         return SourceView(tl, [Segment(0, str(path.resolve()), g_start, dur, wstart)]), path
 
     def submit(self, clip, tl, feats):
@@ -2692,7 +2813,15 @@ def main():
                     f"{rewind.label} from the stream's rewind")
             except Exception as e:
                 log(f"low-data live unavailable ({str(e)[:100]}); recording at full resolution")
-        recorder = Recorder(args.source, segdir, args.seg_time, rec_min, rec_max)
+        recorder = None
+        if args.live_lowres != "off" or rewind is not None:
+            if "youtube.com" in host or "youtu.be" in host:
+                try:   # YouTube: fetch the stream's pieces directly (no playlist re-downloads)
+                    recorder = YouTubePieceRecorder(args.source, segdir, args.seg_time, rec_max)
+                except Exception as e:
+                    log(f"recorder: piece recording unavailable ({str(e)[:80]}); using ffmpeg")
+        if recorder is None:
+            recorder = Recorder(args.source, segdir, args.seg_time, rec_min, rec_max)
         recorder.start()
         if not args.no_chat:
             host = args.source.lower()
