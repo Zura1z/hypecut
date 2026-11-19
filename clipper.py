@@ -2320,12 +2320,21 @@ class Renderer:
         self.worker.start()
 
     def hires_source(self, clip, tl):
+        try:
+            return self._hires_source(clip, tl, learned=self.rewind_n > 0)
+        except RuntimeError as e:
+            if self.rewind_n > 0 and "doesn't cover" in str(e):   # offset jumped: once more with the wide margin
+                log(f"hi-res: {e}; fetching again with a wider margin")
+                return self._hires_source(clip, tl, learned=False)
+            raise
+
+    def _hires_source(self, clip, tl, learned):
         """Fetch the clip's stretch at max resolution from the YouTube rewind buffer and place it on the global clock
         by matching its audio against the low-res recording. The clock estimate is off by a steady few seconds per
         stream (latency): once one clip has measured it, the fetch is shifted by it and the margin shrinks from 20 s
         to 8 s on each side, which is ~35-45% less data per clip."""
-        learned = self.rewind_n > 0
-        margin, bias = (8.0, self.rewind_bias) if learned else (20.0, 0.0)
+        # margin: 8 s plus one piece (2-5 s pieces quantise the timing) once the offset is known, else 20 s
+        margin, bias = (8.0 + self.rewind.td, self.rewind_bias) if learned else (20.0, self.rewind_bias)
         g0, g1 = clip.start - margin, clip.end + margin
         d = self.outdir / ".work" / "hires"
         d.mkdir(parents=True, exist_ok=True)
